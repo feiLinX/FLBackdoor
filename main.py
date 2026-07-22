@@ -44,7 +44,7 @@ def args_parser():
 
     # FL
     parser.add_argument("--aggregation", help="aggregation rule", default='fedavg', type=str,
-                        choices=['simple mean', 'fedavg', 'weighted fedavg'])
+                        choices=['fedavg', 'krum', 'flame'])
     parser.add_argument("--nrounds", help="# global rounds", default=100, type=int)
     parser.add_argument("--epochs", help="# local epochs", default=5, type=int)
     parser.add_argument("--nclients", help="# clients", default=20, type=int)
@@ -75,12 +75,14 @@ def args_parser():
     parser.add_argument("--bd_max_search", help="max donor pool entries scanned per victim sample when finding the nearest match", default=500, type=int)
     
     # Logging
-    parser.add_argument("--data_dir", type=str, required=False, default="/export/home/jmh8504/data/", 
+    parser.add_argument("--data_dir", type=str, required=False, default="/scratch/jmh8504/data/", 
                         choices=['/scratch/jmh8504/data/', '/export/home/jmh8504/data/'],)
-    parser.add_argument('--logdir', type=str, required=False, default="/export/home/jmh8504/FL/flbackdoor/logs/",
+
+    parser.add_argument('--logdir', type=str, required=False, default="/scratch/jmh8504/FL/flbackdoor/logs/",
                         choices=['/scratch/jmh8504/FL/flbackdoor/logs/', '/export/home/jmh8504/FL/flbackdoor/logs/'],)
+                        
     parser.add_argument('--log_file_name', type=str, default=None, help='The log file name')
-    parser.add_argument('--ckptdir', type=str, required=False, default="/export/home/jmh8504/FL/flbackdoor/saved_models/",
+    parser.add_argument('--ckptdir', type=str, required=False, default="/scratch/jmh8504/FL/flbackdoor/saved_models/",
                         choices=['/scratch/jmh8504/FL/flbackdoor/saved_models/', '/export/home/jmh8504/FL/flbackdoor/saved_models/'],)
     
     parser.add_argument('--print_interval', type=int, default=10,
