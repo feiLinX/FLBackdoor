@@ -75,13 +75,13 @@ def args_parser():
     parser.add_argument("--bd_max_search", help="max donor pool entries scanned per victim sample when finding the nearest match", default=500, type=int)
     
     # Logging
-    parser.add_argument("--data_dir", type=str, required=False, default="/scratch/jmh8504/data/", 
-                        help="directory for storing datasets")
-    parser.add_argument('--logdir', type=str, required=False, default="/scratch/jmh8504/FL/flbackdoor/logs/",
-                        help='Log directory path')
+    parser.add_argument("--data_dir", type=str, required=False, default="/export/home/jmh8504/data/", 
+                        choices=['/scratch/jmh8504/data/', '/export/home/jmh8504/data/'],)
+    parser.add_argument('--logdir', type=str, required=False, default="/export/home/jmh8504/FL/flbackdoor/logs/",
+                        choices=['/scratch/jmh8504/FL/flbackdoor/logs/', '/export/home/jmh8504/FL/flbackdoor/logs/'],)
     parser.add_argument('--log_file_name', type=str, default=None, help='The log file name')
-    parser.add_argument('--ckptdir', type=str, required=False, default="/scratch/jmh8504/FL/flbackdoor/models/",
-                        help='directory to save model')
+    parser.add_argument('--ckptdir', type=str, required=False, default="/export/home/jmh8504/FL/flbackdoor/saved_models/",
+                        choices=['/scratch/jmh8504/FL/flbackdoor/saved_models/', '/export/home/jmh8504/FL/flbackdoor/saved_models/'],)
     
     parser.add_argument('--print_interval', type=int, default=10,
                         help='how many comm round to print results on screen')
