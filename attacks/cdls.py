@@ -15,10 +15,7 @@ from data_aug_utils import AutoAugment
 from datasets.crossdomain import DigitsDataset
 
 def _pil_resize_like(img, target_hw):
-    """Resize a uint8 HWC numpy image to match target_hw=(H, W) if needed,
-    so cross-domain donor images (which may come from a differently-sized
-    digit-5 domain) can replace a victim sample of another domain's shape.
-    """
+
     if img.shape[:2] == tuple(target_hw):
         return img
     resized = Image.fromarray(img).resize((target_hw[1], target_hw[0]))
@@ -26,7 +23,7 @@ def _pil_resize_like(img, target_hw):
 
 
 def _kld_raw(img_a, img_b):
-    """KL_distance between two uint8 HWC numpy images, treating raw pixels as the feature."""
+
     ta = torch.from_numpy(img_a.astype(np.float32))
     tb = torch.from_numpy(img_b.astype(np.float32))
 
@@ -43,10 +40,7 @@ def _kld_raw(img_a, img_b):
 
 
 def get_digits_transforms(args):
-    """Build the (train, test) transform pipelines used for the 'digits' dataset.
-    Pulled out of get_dataloader so the backdoor pipeline can reuse the exact same
-    augmentation/normalization when wrapping in-memory (poisoned) client data.
-    """
+
     normalize = transforms.Normalize((0.1307,), (0.3081,))
     transform_train = [
         transforms.ToPILImage(),
@@ -74,12 +68,7 @@ def get_digits_transforms(args):
 
 def build_digits_donor_pool(data_dir, donor_domains, target_label, train=True,
                              pool_size_per_domain=500, seed=0):
-    """Collect (uint8 HWC image, int label) samples from `donor_domains` (any
-    digit-5 sub-dataset other than the victim client's own domain) whose
-    label != target_label -- the only samples eligible to be planted in
-    place of a target_label sample. `pool_size_per_domain` randomly
-    subsamples each domain to keep the nearest-neighbor search tractable.
-    """
+
     rng = random.Random(seed)
     pool = []
     for domain in donor_domains:
@@ -95,29 +84,7 @@ def build_digits_donor_pool(data_dir, donor_domains, target_label, train=True,
 
 def poison_label_swap(images, labels, target_label, partition, donor_pool,
                        max_search=200, threshold=None, seed=0):
-    """Replace `partition` fraction of `images`/`labels` entries whose label
-    equals `target_label` with the visually-nearest (raw-pixel KL divergence)
-    sample from `donor_pool` (a list of (image, label) pairs whose label is
-    guaranteed != target_label). The replaced entry's label is left as
-    `target_label`, so a model trained on it associates the donor's visual
-    pattern with `target_label` instead of the donor's own true label --
-    this is the backdoor.
 
-    Args:
-        images, labels: parallel lists; `images` entries are replaced in place.
-        target_label:   the label whose samples are targeted for replacement.
-        partition:      fraction in [0, 1] of target_label samples to replace.
-        donor_pool:     list of (image, label) candidates, label != target_label.
-        max_search:     cap on how many donor_pool entries are scanned per
-                        victim sample (keeps the search tractable).
-        threshold:      if set, only replace when the best KL distance found
-                        is below this value; None (default) always uses the
-                        best match found.
-        seed:           for reproducible victim/donor sampling.
-
-    Returns:
-        list of indices (into images/labels) that were actually replaced.
-    """
     rng = random.Random(seed)
 
     victim_idx = [i for i, l in enumerate(labels) if int(l) == int(target_label)]
@@ -149,11 +116,7 @@ def poison_label_swap(images, labels, target_label, partition, donor_pool,
 
 
 class InMemoryImageDataset(Dataset):
-    """Wrap a list of (uint8 HWC numpy image, int label) pairs so poisoned
-    data -- which mixes raw pixels sourced from multiple digit-domain
-    donors -- can go through the same transform pipeline as the path-based
-    DigitsDataset (ToPILImage -> ... -> ToTensor -> Normalize).
-    """
+
     def __init__(self, images, labels, transform=None):
         self.images = images
         self.labels = labels
@@ -173,30 +136,7 @@ class InMemoryImageDataset(Dataset):
 def build_digits_backdoor(args, client2dataidx, adv_clients, target_label, partition,
                            domain='mnist', donor_domains=('mnist_m', 'svhn', 'syn', 'usps'),
                            donor_pool_size=500, max_search=200, threshold=None, seed=0):
-    """Build client train loaders (with `adv_clients` poisoned) plus the
-    loaders needed to report ACC/ASR/train_asr for the cross-domain
-    label-swap backdoor.
 
-    - `adv_clients`: list of client ids to poison -- its length is the
-      "number of clients" running the attack.
-    - `target_label`: the "original" label whose samples get replaced.
-    - `partition`: fraction of that client's target_label samples to replace.
-
-    Returns:
-        client2loaders:   dict[client_id -> DataLoader]; benign clients use
-            the normal path-based pipeline, adv_clients use an in-memory
-            poisoned dataset.
-        clean_test_dl:    DataLoader over the untouched (held-out) test
-            samples -> ACC.
-        backdoor_test_dl: DataLoader over freshly-poisoned held-out test
-            samples (labeled target_label) -> ASR, which measures whether
-            the backdoor generalizes to unseen donor-style inputs. None if
-            no test sample was replaced.
-        train_poison_dl:  DataLoader over the literal poisoned training
-            samples planted into adv_clients (labeled target_label) ->
-            train_asr, a memorization diagnostic (see evaluate_acc_asr).
-            None if nothing was replaced.
-    """
     transform_train, transform_test = get_digits_transforms(args)
 
     # ---- train side: poison the selected clients' own-domain data ----
