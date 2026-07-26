@@ -1,5 +1,4 @@
 import os
-import torch
 import numpy as np
 import torchvision.transforms as transforms
 from torch.utils.data import Dataset

@@ -1,7 +1,5 @@
 import os
 import sys
-
-import torch
 import torch.nn as nn
 import torch.optim as optim
 
@@ -25,10 +23,13 @@ def fedavg_global(global_net, client2loaders, nets_this_round):
     global_net.load_state_dict(w_global)
 
 
-def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_ls_rounds, comm_round, test_dl):
+def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_ls_rounds, comm_round, test_dl, adv_clients=None):
     # local training on all selected clients
     client_ls_current = client_ls_rounds[comm_round]
     nets_current = {k: client2nets[k] for k in client_ls_current}
+
+    adv_clients = set(adv_clients) if adv_clients is not None else set()
+    model_poison = getattr(args, 'bd_model_poison', False)
 
     # distribute the global model
     w_global = global_net.state_dict()
@@ -39,6 +40,9 @@ def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_l
         net = client2nets[client_idx]
         net.train()
         net.cuda()
+
+        is_adv = model_poison and (client_idx in adv_clients) and args.bd_stealth_lambda > 0
+        ref_params = [p.detach().clone() for p in net.parameters()] if is_adv else None
 
         train_loader = client2loaders[client_idx]
         test_loader = test_dl

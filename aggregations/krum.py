@@ -7,10 +7,8 @@ def krum(global_net, client2loaders, nets_this_round, nbyz=0, m=1):
     nets = list(nets_this_round.values())
     n = len(nets)
 
-    # flatten each client's trainable params into one vector (excl. BN buffers)
     vectors = [torch.cat([p.detach().reshape(-1) for p in net.parameters()]) for net in nets]
 
-    # pairwise squared Euclidean distances between client updates
     dists = torch.zeros(n, n)
     for i in range(n):
         for j in range(i + 1, n):
@@ -18,7 +16,6 @@ def krum(global_net, client2loaders, nets_this_round, nbyz=0, m=1):
             dists[i, j] = d
             dists[j, i] = d
 
-    # Krum score: sum of the k = n - nbyz - 2 nearest neighbour distances
     k = max(n - nbyz - 2, 1)
     scores = torch.empty(n)
     for i in range(n):

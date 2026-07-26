@@ -5,6 +5,15 @@ from data_aug_utils import AutoAugment
 from datasets import DigitsDataset, DomainNetDataset, OfficeDataset, CIFAR10_truncated, CIFAR100_truncated
 
 
+class TwoCropTransform:
+    """Create two crops of the same image"""
+    def __init__(self, transform):
+        self.transform = transform
+
+    def __call__(self, x):
+        return [self.transform(x), self.transform(x)]
+
+
 def load_digits_data(data_dir):
     transform = transforms.Compose([transforms.ToTensor()])
 

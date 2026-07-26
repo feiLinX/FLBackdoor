@@ -6,9 +6,9 @@ set -euo pipefail
 PYTHON=/scratch/jmh8504/envs/jz/bin/python
 SCRIPT="$(dirname "$0")/main.py"
 
-MODELS=(mobilenetv2 resnet34 resnet18)
-NBYZ=(4 2)
-PARTITIONS=(0.1 0.3 0.5 1.0)
+MODELS=(resnet34)
+NBYZ=(4 2 1)
+PARTITIONS=(0.3 0.5 1.0)
 
 for model in "${MODELS[@]}"; do
     for nbyz in "${NBYZ[@]}"; do

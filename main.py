@@ -1,29 +1,16 @@
-import os, sys, copy, glob
-import time, random
-import numpy as np
-import pickle
+import os
+import random
 import logging
 import datetime
 import json
-import gc
 import argparse
-
 import torch
-import torch.utils.data as data
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, TensorDataset
-
-import torchvision
-import torchvision.transforms as transforms
-
 from utils import *
 from data_utils import *
 from models import ResNet18, ResNet34, ResNet50, ResNet18Small, ResNet34Small, ResNet50Small, MobileNetV2, MobileNetV2Large, FangCNN
-from attacks.cdls import build_digits_backdoor
+from attacks.cdls import AdversaryExtractor, build_digits_backdoor, pretrain_simclr_digits, train_adv_classifier, apply_model_poison_constraint
 from data_aug_utils import AutoAugment
-from aggregations import fedavg_local, fedavg_global, flame_global, krum_global
+from aggregations import fedavg_local, fedavg_global, flame, krum, trimmed_mean
 
 
 def args_parser():
@@ -31,7 +18,7 @@ def args_parser():
     # Model
     parser.add_argument("--dataset", help="dataset", default='digits', type=str,
                         choices=['digits', 'office', 'domain', 'cifar10', 'cifar100'])
-    parser.add_argument("--model", help="training model", default="resnet18", type=str,
+    parser.add_argument("--model", help="training model", default="mobilenetv2", type=str,
                         choices=['cnn','resnet18', 'resnet34', 'resnet50', 'mobilenetv2'])
     parser.add_argument("--lr", help="learning rate", default=5e-4, type=float)
     parser.add_argument("--momentum", help="SGD momentum", default=0.9, type=float)
@@ -42,8 +29,8 @@ def args_parser():
 
     # FL
     parser.add_argument("--aggregation", help="aggregation rule", default='fedavg', type=str,
-                        choices=['fedavg', 'krum', 'flame'])
-    parser.add_argument("--nrounds", help="# global rounds", default=100, type=int)
+                        choices=['fedavg', 'krum', 'flame', 'trim'])
+    parser.add_argument("--nrounds", help="# global rounds", default=60, type=int)
     parser.add_argument("--epochs", help="# local epochs", default=5, type=int)
     parser.add_argument("--nclients", help="# clients", default=20, type=int)
     parser.add_argument("--fraction", help="fraction of clients", default=1.0, type=float)
@@ -57,21 +44,33 @@ def args_parser():
                         "applied to independently-sampled copies each epoch, inflating the effective per-round "
                         "dataset size without adding new raw images", default=10, type=int)
 
+    parser.add_argument('--krum_m', help="number of clients to select for Krum aggregation", default=1, type=int)
+
     # Adversarial
     parser.add_argument("--adv_type", help="adv type", default='None', type=str,
                         choices=['None', 'CDLS'])
     parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=4, type=int)
-    parser.add_argument("--feature", help="feature extraction", default='raw', type=str,
-                        choices=['raw','tsne','proto'])
     parser.add_argument("--bd_target_label", help="original label targeted by the CDLS backdoor", default=0, type=int)
     parser.add_argument("--bd_partition", help="fraction of a client's target_label samples to replace with the nearest cross-domain donor sample", default=0.5, type=float)
-    parser.add_argument("--bd_adv_clients", help="explicit client ids running the CDLS backdoor; defaults to the first --nbyz clients when not set", default=None, type=int, nargs='+')
     parser.add_argument("--bd_domain", help="digits sub-dataset the clients are assigned to", default='mnist', type=str,
                         choices=['mnist', 'mnist_m', 'svhn', 'syn', 'usps'])
     parser.add_argument("--bd_donor_domains", help="digits sub-datasets donor replacement samples are drawn from; defaults to all domains other than --bd_domain", default=None, type=str, nargs='+')
     parser.add_argument("--bd_donor_pool_size", help="max donor samples per domain kept for the nearest-neighbor search", default=1000, type=int)
     parser.add_argument("--bd_max_search", help="max donor pool entries scanned per victim sample when finding the nearest match", default=500, type=int)
-    
+
+    # Learned SimCLR features
+    parser.add_argument("--bd_distance", help="donor-selection distance for CDLS", default='raw_kl', type=str,
+                        choices=['raw_kl', 'embed_kl', 'pred_kl'])
+    parser.add_argument("--bd_simclr_epochs", help="adversary SimCLR pretraining epochs (embed_kl/pred_kl)", default=50, type=int)
+    parser.add_argument("--bd_simclr_dim", help="adversary SimCLR projection dim", default=128, type=int)
+    parser.add_argument("--bd_simclr_bs", help="adversary SimCLR batch size", default=128, type=int)
+    parser.add_argument("--bd_simclr_temp", help="adversary SimCLR NT-Xent temperature", default=0.5, type=float)
+
+    parser.add_argument("--bd_clean_baseline", help="train a clean model but still build the CDLS backdoor test set, to report baseline ASR", action='store_true')
+    parser.add_argument("--bd_model_poison", help="enable model-poisoning on top of CDLS data poisoning (stealth reg + constrain-and-scale)", action='store_true')
+    parser.add_argument("--bd_stealth_lambda", help="weight of the ||w - w_global||^2 stealth/anomaly-evasion regularizer on malicious clients", default=0.0, type=float)
+    parser.add_argument("--bd_scale", help="malicious update scaling factor for constrain-and-scale (capped at the benign median update norm)", default=1.0, type=float)
+
     # Logging
     parser.add_argument("--data_dir", type=str, required=False, default="/scratch/jmh8504/data/", 
                         choices=['/scratch/jmh8504/data/', '/export/home/jmh8504/data/'],)
@@ -89,9 +88,10 @@ def args_parser():
 
                         help='how many rounds do we save the checkpoint one time') 
 
-    args, unknown = parser.parse_known_args() 
+    args, unknown = parser.parse_known_args([]) 
 
     return args
+
         
 
 def init_model(nclients, args):
@@ -117,6 +117,7 @@ def init_model(nclients, args):
 
 
 if __name__ == "__main__":
+
     args = args_parser()
     print(args)
     #=============== Logging setup ===============
@@ -158,21 +159,40 @@ if __name__ == "__main__":
 
     client2dataidx = partition_data(dataset=args.dataset, datadir=args.data_dir, partition=args.partition,
                                      n_clients=args.nclients, alpha=args.bias)
-    
+
+    adv_clients = [] 
+
     if args.adv_type == 'CDLS':
-        adv_clients = args.bd_adv_clients if args.bd_adv_clients is not None else list(range(args.nbyz))
+        adv_clients = list(range(args.nbyz))
         donor_domains = args.bd_donor_domains if args.bd_donor_domains is not None else \
             [d for d in ['mnist', 'mnist_m', 'svhn', 'syn', 'usps'] if d != args.bd_domain]
 
-        logger.info("Building cross-domain label-swap backdoor (target_label=%s, partition=%s, adv_clients=%s)"
-                    % (str(args.bd_target_label), str(args.bd_partition), str(adv_clients)))
-    
-        # Build poisoned train loaders for selected clients
+        # --- adversary-side SimCLR feature extractor ---
+        extractor = None
+        if args.bd_distance != 'raw_kl':
+            simclr_domains = ['mnist', 'mnist_m', 'svhn', 'syn', 'usps']  # pretrain on all 5 domains
+            logger.info("Adversary pretraining SimCLR on %s (distance=%s)" % (simclr_domains, args.bd_distance))
+            print("Adversary pretraining SimCLR (distance=%s) ..." % args.bd_distance)
+            encoder = pretrain_simclr_digits(args, simclr_domains, logger=logger)
+            classifier = train_adv_classifier(encoder, args, simclr_domains, logger=logger) \
+                if args.bd_distance == 'pred_kl' else None
+            extractor = AdversaryExtractor(encoder, classifier)
+
+        # --- clean-model baseline ---
+        if args.bd_clean_baseline:
+            logger.info("CLEAN BASELINE: training a clean model, reporting baseline ASR on the CDLS test set")
+            print("CLEAN BASELINE: no training client is poisoned; reporting baseline ASR")
+            adv_clients = []  
+
+        logger.info("Building CDLS backdoor (target_label=%s, partition=%s, adv_clients=%s, distance=%s)"
+                    % (str(args.bd_target_label), str(args.bd_partition), str(adv_clients), args.bd_distance))
+
         client2loaders, test_dl, backdoor_test_dl, train_poison_dl = build_digits_backdoor(
             args, client2dataidx, adv_clients, args.bd_target_label, args.bd_partition,
             domain=args.bd_domain, donor_domains=donor_domains,
-            donor_pool_size=args.bd_donor_pool_size, max_search=args.bd_max_search, seed=args.init_seed)
-        
+            donor_pool_size=args.bd_donor_pool_size, max_search=args.bd_max_search, seed=args.init_seed,
+            distance_mode=args.bd_distance, extractor=extractor)
+
         global_train_dl, _ = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
                                          train_bs=args.batch_size, test_bs=args.batch_size)
     elif args.adv_type == 'None':
@@ -188,7 +208,6 @@ if __name__ == "__main__":
                                                     train_bs = args.batch_size, test_bs = args.batch_size)
     
 
-    # Random client sampling support
     clients_per_round = int(args.nclients * args.fraction)
     client_ls = [i for i in range(args.nclients)]
     client_ls_rounds = []
@@ -211,21 +230,36 @@ if __name__ == "__main__":
         logger.info("Communication round %d" % comm_round)
 
         # local training on all selected clients
-        nets_current = fedavg_local(args, global_net, logger, client2nets, client2loaders, client_ls_rounds, comm_round, test_dl)
+        nets_current = fedavg_local(args, global_net, logger, client2nets, client2loaders,
+                                    client_ls_rounds, comm_round, test_dl, adv_clients=adv_clients)
 
-        # global aggregation
-        fedavg_global(global_net, client2loaders, nets_current)
+        # optional model-poisoning
+        if args.adv_type == 'CDLS' and args.bd_model_poison and adv_clients:
+            round_adv = [c for c in adv_clients if c in nets_current]
+            if round_adv:
+                apply_model_poison_constraint(global_net, nets_current, round_adv, scale=args.bd_scale)
+
+        if args.aggregation == 'krum':
+            krum(global_net, client2loaders, nets_current, nbyz=args.nbyz, m=args.krum_m)
+        elif args.aggregation == 'flame':
+            flame(global_net, client2loaders, nets_current)
+        elif args.aggregation == 'trim':
+            trimmed_mean(global_net, client2loaders, nets_current, b=args.nbyz)
+        else:
+            fedavg_global(global_net, client2loaders, nets_current)
 
         # compute ACC/ASR/train_asr
         global_net.cuda()
         train_acc, train_loss = compute_accuracy(global_net, global_train_dl)
+
         if args.adv_type == 'CDLS':
             test_acc, asr, train_asr = evaluate_acc_asr(global_net, test_dl, backdoor_test_dl, train_poison_dl)
             global_net.to('cpu')
 
+            asr_tag = 'Baseline ASR' if args.bd_clean_baseline else 'Test ASR'
             logger.info('>> Global Model Train Acc: %f' % train_acc)
             logger.info('>> Global Model Test ACC: %f' % test_acc)
-            logger.info('>> Global Model Test ASR: %f' % asr)
+            logger.info('>> Global Model %s: %f' % (asr_tag, asr))
             logger.info('>> Global Model Train-Poison ASR: %f' % train_asr)
             logger.info('>> Global Model Train Loss: %f' % train_loss)
 
@@ -233,9 +267,10 @@ if __name__ == "__main__":
                 print('round: ', str(comm_round))
                 print('>> Global Model Train accuracy: %f' % train_acc)
                 print('>> Global Model Test ACC: %f' % test_acc)
-                print('>> Global Model Test ASR: %f' % asr)
+                print('>> Global Model %s: %f' % (asr_tag, asr))
                 print('>> Global Model Train-Poison ASR: %f' % train_asr)
                 print('>> Global Model Train loss: %f' % train_loss)
+
         elif args.adv_type == 'None':
             test_acc, test_loss = compute_accuracy(global_net, test_dl)
             global_net.to('cpu')

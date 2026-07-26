@@ -1,16 +1,19 @@
-import torch
 import random
 import os
 import sys
 import numpy as np
-import torchvision.transforms.functional as TF
+import torch
+import torch.nn.functional as F
+import torchvision
+import torch.nn as nn
+import torch.optim as optim
 import torchvision.transforms as transforms
 from PIL import Image
 from scipy.stats import entropy
 from torch.utils.data import Dataset, DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data_utils import get_dataloader
+from data_utils import get_dataloader, TwoCropTransform
 from data_aug_utils import AutoAugment
 from datasets.crossdomain import DigitsDataset
 
@@ -66,9 +69,191 @@ def get_digits_transforms(args):
     return transform_train, transform_test
 
 
+# ---------------------------- Embedding-KLD and Prediction-KLD ----------------------------
+class ProjectionHead(nn.Module):
+    def __init__(self, in_dim=512, hidden_dim=512, out_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+    
+
+class SimCLRNet(nn.Module):
+    """CIFAR-style ResNet18 encoder f (32x32 stem) + MLP projection head g."""
+    def __init__(self, proj_dim=128):
+        super().__init__()
+        base = torchvision.models.resnet18()
+        base.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        nn.init.kaiming_normal_(base.conv1.weight, mode='fan_out', nonlinearity='relu')
+        base.maxpool = nn.Identity()
+        self.encoder = nn.Sequential(*list(base.children())[:-1], nn.Flatten())  # -> [B, 512]
+        self.feat_dim = 512
+        self.projector = ProjectionHead(self.feat_dim, self.feat_dim, proj_dim)
+
+    def forward(self, x):
+        h = self.encoder(x)      # representation used for embed_kl / pred_kl
+        z = self.projector(h)    # used only by the contrastive loss
+        return h, z
+    
+
+def nt_xent_loss(z1, z2, temperature=0.5):
+    """NT-Xent (SimCLR) loss over 2B views; z1[i] and z2[i] are a positive pair."""
+    B = z1.size(0)
+    z = F.normalize(torch.cat([z1, z2], dim=0), dim=1)   # [2B, D]
+    sim = (z @ z.t()) / temperature                      # [2B, 2B]
+    self_mask = torch.eye(2 * B, dtype=torch.bool, device=z.device)
+    sim.masked_fill_(self_mask, float('-inf'))
+    targets = (torch.arange(2 * B, device=z.device) + B) % (2 * B)
+    return F.cross_entropy(sim, targets)
+
+
+def get_simclr_transform():
+    """SimCLR augmentations for 3-channel 32x32 digit images (input: HWC uint8)."""
+    return transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.RandomResizedCrop(32, scale=(0.5, 1.0)),
+        transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.RandomApply([transforms.GaussianBlur(3)], p=0.5),
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+    ])
+
+
+def pretrain_simclr_digits(args, domains, epochs=None, proj_dim=None,
+                           batch_size=None, temperature=None, lr=1e-3, logger=None):
+    """Self-supervised SimCLR pretraining on the pooled digit-5 domains."""
+    epochs = args.bd_simclr_epochs if epochs is None else epochs
+    proj_dim = args.bd_simclr_dim if proj_dim is None else proj_dim
+    batch_size = args.bd_simclr_bs if batch_size is None else batch_size
+    temperature = args.bd_simclr_temp if temperature is None else temperature
+
+    two_crop = TwoCropTransform(get_simclr_transform())
+    ds_list = [DigitsDataset(args.data_dir, d, train=True, transform=two_crop) for d in domains]
+    pool = torch.utils.data.ConcatDataset(ds_list)
+    loader = DataLoader(pool, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True)
+
+    model = SimCLRNet(proj_dim=proj_dim).cuda()
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
+    model.train()
+    for epoch in range(epochs):
+        running, nb = 0.0, 0
+        for views, _ in loader:
+            v1, v2 = views[0].cuda(), views[1].cuda()
+            _, z1 = model(v1)
+            _, z2 = model(v2)
+            loss = nt_xent_loss(z1, z2, temperature)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running += loss.item(); nb += 1
+        msg = 'SimCLR pretrain epoch %d/%d | loss %.4f' % (epoch + 1, epochs, running / max(nb, 1))
+        if logger is not None:
+            logger.info(msg)
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(msg)
+    model.eval()
+    return model
+
+
+def train_adv_classifier(encoder, args, domains, epochs=10, lr=1e-2, logger=None):
+    """Linear probe (adversary classifier) on the frozen SimCLR encoder; used by
+    pred_kl to obtain class-probability distributions for donor selection."""
+    tf = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((32, 32)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+    ])
+    ds_list = [DigitsDataset(args.data_dir, d, train=True, transform=tf) for d in domains]
+    pool = torch.utils.data.ConcatDataset(ds_list)
+    loader = DataLoader(pool, batch_size=256, shuffle=True, num_workers=4)
+
+    encoder = encoder.cuda().eval()
+    clf = nn.Linear(encoder.feat_dim, 10).cuda()
+    optimizer = optim.Adam(clf.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+    clf.train()
+    for epoch in range(epochs):
+        running, nb = 0.0, 0
+        for x, y in loader:
+            x, y = x.cuda(), y.to(dtype=torch.int64).cuda()
+            with torch.no_grad():
+                h = encoder.encoder(x)
+            loss = criterion(clf(h), y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running += loss.item(); nb += 1
+        if logger is not None:
+            logger.info('adv-classifier epoch %d/%d | loss %.4f' % (epoch + 1, epochs, running / max(nb, 1)))
+    clf.eval()
+    return clf
+
+
+class AdversaryExtractor:
+    """Adversary-side wrapper turning raw HWC uint8 digit images into either
+    SimCLR embeddings (embed_kl) or class-probability vectors (pred_kl)."""
+    def __init__(self, encoder, classifier=None):
+        self.encoder = encoder.cuda().eval()
+        self.classifier = classifier.cuda().eval() if classifier is not None else None
+        self.tf = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((32, 32)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+        ])
+
+    def _to_batch(self, images):
+        return torch.stack([self.tf(im) for im in images]).cuda()
+
+    @torch.no_grad()
+    def embed(self, images, bs=256):
+        outs = []
+        for i in range(0, len(images), bs):
+            outs.append(self.encoder.encoder(self._to_batch(images[i:i + bs])).cpu())
+        return torch.cat(outs, dim=0) if outs else torch.empty(0)
+
+    @torch.no_grad()
+    def predict(self, images, bs=256):
+        assert self.classifier is not None, "pred_kl needs an adversary classifier"
+        outs = []
+        for i in range(0, len(images), bs):
+            h = self.encoder.encoder(self._to_batch(images[i:i + bs]))
+            outs.append(F.softmax(self.classifier(h), dim=1).cpu())
+        return torch.cat(outs, dim=0) if outs else torch.empty(0)
+    
+
+def _kld_vec(p, q):
+    """Symmetric KL (Jeffreys / 2) between two 1-D probability-like vectors."""
+    p = torch.clip(p.float(), 1e-10, None); p = p / p.sum()
+    q = torch.clip(q.float(), 1e-10, None); q = q / q.sum()
+    kl_pq = torch.sum(p * (p.log() - q.log()))
+    kl_qp = torch.sum(q * (q.log() - p.log()))
+    return (0.5 * (kl_pq + kl_qp)).item()
+
+
+def _compute_donor_reprs(donor_pool, distance_mode, extractor):
+    """Precompute donor representations for embed_kl / pred_kl (None for raw_kl)."""
+    if distance_mode == 'raw_kl' or extractor is None:
+        return None
+    imgs = [img for img, _ in donor_pool]
+    if distance_mode == 'embed_kl':
+        return F.softmax(extractor.embed(imgs), dim=1)
+    elif distance_mode == 'pred_kl':
+        return extractor.predict(imgs)
+    else:
+        raise ValueError("unknown distance_mode: %s" % distance_mode)
+
+
 def build_digits_donor_pool(data_dir, donor_domains, target_label, train=True,
                              pool_size_per_domain=500, seed=0):
-
+    
     rng = random.Random(seed)
     pool = []
     for domain in donor_domains:
@@ -83,7 +268,8 @@ def build_digits_donor_pool(data_dir, donor_domains, target_label, train=True,
 
 
 def poison_label_swap(images, labels, target_label, partition, donor_pool,
-                       max_search=200, threshold=None, seed=0):
+                       max_search=200, threshold=None, seed=0,
+                       distance_mode='raw_kl', extractor=None, donor_reprs=None):
 
     rng = random.Random(seed)
 
@@ -91,28 +277,50 @@ def poison_label_swap(images, labels, target_label, partition, donor_pool,
     n_replace = int(round(len(victim_idx) * partition))
     victim_idx = rng.sample(victim_idx, n_replace) if n_replace > 0 else []
 
+    # precompute victim representations once (embed_kl / pred_kl only)
+    victim_reprs = None
+    if distance_mode in ('embed_kl', 'pred_kl') and victim_idx:
+        victim_imgs = [images[i] for i in victim_idx]
+        if distance_mode == 'embed_kl':
+            victim_reprs = F.softmax(extractor.embed(victim_imgs), dim=1)
+        else:
+            victim_reprs = extractor.predict(victim_imgs)
+
+    pool_size = len(donor_pool)
     replaced = []
-    for idx in victim_idx:
+    for vpos, idx in enumerate(victim_idx):
         victim_img = images[idx]
         target_hw = victim_img.shape[:2]
 
-        search_pool = donor_pool if len(donor_pool) <= max_search else rng.sample(donor_pool, max_search)
+        if pool_size <= max_search:
+            cand = range(pool_size)
+        else:
+            cand = rng.sample(range(pool_size), max_search)
 
-        best_dist, best_img = float('inf'), None
-        for donor_img, _ in search_pool:
-            donor_resized = _pil_resize_like(donor_img, target_hw)
-            dist = _kld_raw(victim_img, donor_resized)
-            if dist < best_dist:
-                best_dist, best_img = dist, donor_resized
+        best_dist, best_j = float('inf'), None
+        if distance_mode == 'raw_kl':
+            for j in cand:
+                donor_resized = _pil_resize_like(donor_pool[j][0], target_hw)
+                dist = _kld_raw(victim_img, donor_resized)
+                if dist < best_dist:
+                    best_dist, best_j = dist, j
+        else:
+            vr = victim_reprs[vpos]
+            for j in cand:
+                dist = _kld_vec(vr, donor_reprs[j])
+                if dist < best_dist:
+                    best_dist, best_j = dist, j
 
-        if best_img is None:
+        if best_j is None:
             continue
         if threshold is not None and best_dist >= threshold:
             continue
 
-        images[idx] = best_img  # replace pixels; labels[idx] stays target_label
+        # replace pixels with the (resized) donor image; labels[idx] stays target_label
+        images[idx] = _pil_resize_like(donor_pool[best_j][0], target_hw)
         replaced.append(idx)
     return replaced
+
 
 
 class InMemoryImageDataset(Dataset):
@@ -135,13 +343,15 @@ class InMemoryImageDataset(Dataset):
 
 def build_digits_backdoor(args, client2dataidx, adv_clients, target_label, partition,
                            domain='mnist', donor_domains=('mnist_m', 'svhn', 'syn', 'usps'),
-                           donor_pool_size=500, max_search=200, threshold=None, seed=0):
+                           donor_pool_size=500, max_search=200, threshold=None, seed=0,
+                           distance_mode='raw_kl', extractor=None):
 
     transform_train, transform_test = get_digits_transforms(args)
 
     # ---- train side: poison the selected clients' own-domain data ----
     train_donor_pool = build_digits_donor_pool(args.data_dir, donor_domains, target_label,
                                                 train=True, pool_size_per_domain=donor_pool_size, seed=seed)
+    train_donor_reprs = _compute_donor_reprs(train_donor_pool, distance_mode, extractor)
 
     client2loaders = {}
     train_poison_images, train_poison_labels = [], []
@@ -153,7 +363,9 @@ def build_digits_backdoor(args, client2dataidx, adv_clients, target_label, parti
             labels = [raw_ds[i][1] for i in range(len(raw_ds))]
 
             replaced_idx = poison_label_swap(images, labels, target_label, partition, train_donor_pool,
-                                              max_search=max_search, threshold=threshold, seed=seed + client_id)
+                                              max_search=max_search, threshold=threshold, seed=seed + client_id,
+                                              distance_mode=distance_mode, extractor=extractor,
+                                              donor_reprs=train_donor_reprs)
             # keep the literal poisoned (image, label) pairs for the train_asr diagnostic
             train_poison_images.extend(images[i] for i in replaced_idx)
             train_poison_labels.extend(labels[i] for i in replaced_idx)
@@ -175,13 +387,16 @@ def build_digits_backdoor(args, client2dataidx, adv_clients, target_label, parti
     # ---- test side: build one mixed test set, split into clean vs replaced ----
     test_donor_pool = build_digits_donor_pool(args.data_dir, donor_domains, target_label,
                                                train=False, pool_size_per_domain=donor_pool_size, seed=seed)
+    test_donor_reprs = _compute_donor_reprs(test_donor_pool, distance_mode, extractor)
 
     test_ds_raw = DigitsDataset(args.data_dir, domain, train=False, transform=None)
     test_images = [test_ds_raw[i][0] for i in range(len(test_ds_raw))]
     test_labels = [test_ds_raw[i][1] for i in range(len(test_ds_raw))]
 
     replaced_idx = poison_label_swap(test_images, test_labels, target_label, partition, test_donor_pool,
-                                      max_search=max_search, threshold=threshold, seed=seed + 10_000)
+                                      max_search=max_search, threshold=threshold, seed=seed + 10_000,
+                                      distance_mode=distance_mode, extractor=extractor,
+                                      donor_reprs=test_donor_reprs)
     replaced_set = set(replaced_idx)
 
     clean_idx = [i for i in range(len(test_labels)) if i not in replaced_set]
@@ -199,3 +414,36 @@ def build_digits_backdoor(args, client2dataidx, adv_clients, target_label, parti
         backdoor_test_dl = None
 
     return client2loaders, clean_test_dl, backdoor_test_dl, train_poison_dl
+
+
+def apply_model_poison_constraint(global_net, nets_current, adv_clients, scale=1.0):
+
+    adv_clients = set(adv_clients)
+    g = {k: v.detach().clone().float().cuda() for k, v in global_net.state_dict().items()}
+    float_keys = [k for k in g if torch.is_floating_point(g[k])]
+
+    def update_norm(net):
+        sd = net.state_dict()
+        return torch.sqrt(sum(((sd[k].float().cuda() - g[k]) ** 2).sum() for k in float_keys))
+
+    benign = [cid for cid in nets_current if cid not in adv_clients]
+    ref = torch.median(torch.stack([update_norm(nets_current[c]) for c in benign])) if benign else None
+
+    for cid in nets_current:
+        if cid not in adv_clients:
+            continue
+        net = nets_current[cid]
+        sd = net.state_dict()
+        new_sd = {}
+        for k in sd:
+            if k in float_keys:
+                new_sd[k] = g[k] + scale * (sd[k].float().cuda() - g[k])
+            else:
+                new_sd[k] = sd[k]
+        if ref is not None:
+            cur = torch.sqrt(sum(((new_sd[k] - g[k]) ** 2).sum() for k in float_keys))
+            if cur > ref:
+                f = ref / (cur + 1e-12)
+                for k in float_keys:
+                    new_sd[k] = g[k] + f * (new_sd[k] - g[k])
+        net.load_state_dict({k: new_sd[k].to(sd[k].dtype).to(sd[k].device) for k in sd})
