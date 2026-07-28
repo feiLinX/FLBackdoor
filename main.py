@@ -49,7 +49,7 @@ def args_parser():
     # Adversarial
     parser.add_argument("--adv_type", help="adv type", default='None', type=str,
                         choices=['None', 'CDLS'])
-    parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=4, type=int)
+    parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=2, type=int)
     parser.add_argument("--bd_target_label", help="original label targeted by the CDLS backdoor", default=0, type=int)
     parser.add_argument("--bd_partition", help="fraction of a client's target_label samples to replace with the nearest cross-domain donor sample", default=0.5, type=float)
     parser.add_argument("--bd_domain", help="digits sub-dataset the clients are assigned to", default='mnist', type=str,
@@ -68,8 +68,8 @@ def args_parser():
 
     parser.add_argument("--bd_clean_baseline", help="train a clean model but still build the CDLS backdoor test set, to report baseline ASR", action='store_true')
     parser.add_argument("--bd_model_poison", help="enable model-poisoning on top of CDLS data poisoning (stealth reg + constrain-and-scale)", action='store_true')
-    parser.add_argument("--bd_stealth_lambda", help="weight of the ||w - w_global||^2 stealth/anomaly-evasion regularizer on malicious clients", default=0.0, type=float)
-    parser.add_argument("--bd_scale", help="malicious update scaling factor for constrain-and-scale (capped at the benign median update norm)", default=1.0, type=float)
+    parser.add_argument("--bd_stealth_lambda", help="weight of the ||w - w_global||^2 stealth/anomaly-evasion regularizer on malicious clients", default=1e-3, type=float)
+    parser.add_argument("--bd_scale", help="malicious update scaling factor for constrain-and-scale (capped at the benign median update norm)", default=2.0, type=float)
 
     # Logging
     parser.add_argument("--data_dir", type=str, required=False, default="/scratch/jmh8504/data/", 
@@ -88,7 +88,7 @@ def args_parser():
 
                         help='how many rounds do we save the checkpoint one time') 
 
-    args, unknown = parser.parse_known_args([]) 
+    args, unknown = parser.parse_known_args() 
 
     return args
 

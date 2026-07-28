@@ -58,7 +58,6 @@ def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_l
 
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=args.lr, momentum=args.momentum, weight_decay=args.wd)
         criterion = nn.CrossEntropyLoss()
-        # Extra loss added here
 
         for epoch in range(args.epochs):
             loss_ls = []
@@ -67,6 +66,11 @@ def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_l
                 optimizer.zero_grad()
                 out, features = net(x, return_features=True)
                 loss = criterion(out, target)
+
+                # Add regularization term to the loss if the client is adversarial
+                if is_adv:
+                    reg = sum(((p - r) ** 2).sum() for p, r in zip(net.parameters(), ref_params))
+                    loss = loss + args.bd_stealth_lambda * reg
                 loss.backward()
                 optimizer.step()
                 loss_ls.append(loss.item())
