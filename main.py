@@ -8,9 +8,10 @@ import torch
 from utils import *
 from data_utils import *
 from models import ResNet18, ResNet34, ResNet50, ResNet18Small, ResNet34Small, ResNet50Small, MobileNetV2, MobileNetV2Large, FangCNN
-from attacks.cdls import AdversaryExtractor, build_digits_backdoor, pretrain_simclr_digits, train_adv_classifier, apply_model_poison_constraint
+from attacks.cdls import CDLS_CONFIG, build_cdls_backdoor, pretrain_simclr_digits, pretrain_simclr_domain, train_adv_classifier, train_adv_classifier_domain, AdversaryExtractor, apply_model_poison_constraint
+from defenses.graid import graid_aggregate
 from data_aug_utils import AutoAugment
-from aggregations import fedavg_local, fedavg_global, flame, krum, trimmed_mean
+from aggregations import fedavg_local, fedavg_global, flame, krum, ndc
 
 
 def args_parser():
@@ -18,7 +19,7 @@ def args_parser():
     # Model
     parser.add_argument("--dataset", help="dataset", default='digits', type=str,
                         choices=['digits', 'office', 'domain', 'cifar10', 'cifar100'])
-    parser.add_argument("--model", help="training model", default="mobilenetv2", type=str,
+    parser.add_argument("--model", help="training model", default="resnet34", type=str,
                         choices=['cnn','resnet18', 'resnet34', 'resnet50', 'mobilenetv2'])
     parser.add_argument("--lr", help="learning rate", default=5e-4, type=float)
     parser.add_argument("--momentum", help="SGD momentum", default=0.9, type=float)
@@ -28,8 +29,8 @@ def args_parser():
     parser.add_argument("--gpu", help="index of gpu", default=0, type=int)
 
     # FL
-    parser.add_argument("--aggregation", help="aggregation rule", default='fedavg', type=str,
-                        choices=['fedavg', 'krum', 'flame', 'trim'])
+    parser.add_argument("--aggregation", help="aggregation rule", default='graid', type=str,
+                        choices=['fedavg', 'krum', 'flame', 'ndc', 'graid'])
     parser.add_argument("--nrounds", help="# global rounds", default=60, type=int)
     parser.add_argument("--epochs", help="# local epochs", default=5, type=int)
     parser.add_argument("--nclients", help="# clients", default=20, type=int)
@@ -46,10 +47,20 @@ def args_parser():
 
     parser.add_argument('--krum_m', help="number of clients to select for Krum aggregation", default=1, type=int)
 
+    # Defense: GRAID (gradient-inversion reconstruction-based anomaly identification)
+    parser.add_argument("--def_num_recon", help="GRAID: # dummy samples reconstructed per client", default=32, type=int)
+    parser.add_argument("--def_recon_iters", help="GRAID: gradient-inversion optimization steps per client per round", default=100, type=int)
+    parser.add_argument("--def_recon_lr", help="GRAID: Adam learning rate for reconstructing dummy (x, y)", default=0.1, type=float)
+    parser.add_argument("--def_tv_weight", help="GRAID: total-variation image-prior weight during reconstruction", default=1e-2, type=float)
+    parser.add_argument("--def_recon_every", help="GRAID: run reconstruction+filtering every K rounds (1=every round); the other rounds fall back to plain FedAvg over all clients to save compute", default=3, type=int)
+    parser.add_argument("--def_warmup", help="GRAID: # initial warm-up rounds during which GRAID does NOT screen (all clients are FedAvg-aggregated); 0 = no warm-up, GRAID active from round 0", default=0, type=int)
+    parser.add_argument("--def_min_cluster", help="GRAID: min reconstructed samples of a class needed to attempt a within-class split", default=6, type=int)
+    parser.add_argument("--def_susp_threshold", help="GRAID: discard a client if this fraction of its reconstructions is suspicious", default=0.3, type=float)
+
     # Adversarial
     parser.add_argument("--adv_type", help="adv type", default='None', type=str,
                         choices=['None', 'CDLS'])
-    parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=2, type=int)
+    parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=4, type=int)
     parser.add_argument("--bd_target_label", help="original label targeted by the CDLS backdoor", default=0, type=int)
     parser.add_argument("--bd_partition", help="fraction of a client's target_label samples to replace with the nearest cross-domain donor sample", default=0.5, type=float)
     parser.add_argument("--bd_domain", help="digits sub-dataset the clients are assigned to", default='mnist', type=str,
@@ -58,14 +69,16 @@ def args_parser():
     parser.add_argument("--bd_donor_pool_size", help="max donor samples per domain kept for the nearest-neighbor search", default=1000, type=int)
     parser.add_argument("--bd_max_search", help="max donor pool entries scanned per victim sample when finding the nearest match", default=500, type=int)
 
-    # Learned SimCLR features
-    parser.add_argument("--bd_distance", help="donor-selection distance for CDLS", default='raw_kl', type=str,
+    # CDLS donor-selection distance space (raw pixels vs learned SimCLR features)
+    parser.add_argument("--bd_distance", help="donor-selection distance for CDLS", default='pred_kl', type=str,
                         choices=['raw_kl', 'embed_kl', 'pred_kl'])
     parser.add_argument("--bd_simclr_epochs", help="adversary SimCLR pretraining epochs (embed_kl/pred_kl)", default=50, type=int)
     parser.add_argument("--bd_simclr_dim", help="adversary SimCLR projection dim", default=128, type=int)
     parser.add_argument("--bd_simclr_bs", help="adversary SimCLR batch size", default=128, type=int)
     parser.add_argument("--bd_simclr_temp", help="adversary SimCLR NT-Xent temperature", default=0.5, type=float)
+    parser.add_argument("--bd_simclr_img_size", help="adversary SimCLR input resolution for DomainNet (natural-image) pretraining; digits/cifar10 always use the 32x32 digit SimCLR and ignore this", default=96, type=int)
 
+    # CDLS evaluation / model-poisoning
     parser.add_argument("--bd_clean_baseline", help="train a clean model but still build the CDLS backdoor test set, to report baseline ASR", action='store_true')
     parser.add_argument("--bd_model_poison", help="enable model-poisoning on top of CDLS data poisoning (stealth reg + constrain-and-scale)", action='store_true')
     parser.add_argument("--bd_stealth_lambda", help="weight of the ||w - w_global||^2 stealth/anomaly-evasion regularizer on malicious clients", default=1e-3, type=float)
@@ -160,36 +173,73 @@ if __name__ == "__main__":
     client2dataidx = partition_data(dataset=args.dataset, datadir=args.data_dir, partition=args.partition,
                                      n_clients=args.nclients, alpha=args.bias)
 
-    adv_clients = [] 
+    adv_clients = []  # the single malicious-client list (data + model poisoning); empty for clean / no-attack runs
 
     if args.adv_type == 'CDLS':
+        if args.dataset not in CDLS_CONFIG:
+            raise NotImplementedError(
+                "CDLS is implemented for dataset in %s; got '%s'" % (list(CDLS_CONFIG.keys()), args.dataset))
+        cfg = CDLS_CONFIG[args.dataset]
         adv_clients = list(range(args.nbyz))
-        donor_domains = args.bd_donor_domains if args.bd_donor_domains is not None else \
-            [d for d in ['mnist', 'mnist_m', 'svhn', 'syn', 'usps'] if d != args.bd_domain]
 
-        # --- adversary-side SimCLR feature extractor ---
+        # victim domain: digits keeps --bd_domain; domain/cifar10 use their fixed default
+        victim_domain = args.bd_domain if args.dataset == 'digits' else cfg['victim_domain']
+
+        # donor domains: explicit override, else per-dataset defaults (for digits,
+        # exclude whichever domain the clients hold so donors stay cross-domain)
+        if args.bd_donor_domains is not None:
+            donor_domains = args.bd_donor_domains
+        elif args.dataset == 'digits':
+            donor_domains = [d for d in ['mnist', 'mnist_m', 'svhn', 'syn', 'usps'] if d != victim_domain]
+        else:
+            donor_domains = cfg['donor_domains']
+
+        # --- adversary-side SimCLR feature extractor (embed_kl / pred_kl only) ---
         extractor = None
         if args.bd_distance != 'raw_kl':
-            simclr_domains = ['mnist', 'mnist_m', 'svhn', 'syn', 'usps']  # pretrain on all 5 domains
-            logger.info("Adversary pretraining SimCLR on %s (distance=%s)" % (simclr_domains, args.bd_distance))
-            print("Adversary pretraining SimCLR (distance=%s) ..." % args.bd_distance)
-            encoder = pretrain_simclr_digits(args, simclr_domains, logger=logger)
-            classifier = train_adv_classifier(encoder, args, simclr_domains, logger=logger) \
-                if args.bd_distance == 'pred_kl' else None
-            extractor = AdversaryExtractor(encoder, classifier)
+            if args.dataset in ('digits', 'cifar10'):
+                # digits & cifar10 share the SAME 32x32 SimCLR: pretrained on the five
+                # digit domains, which are also cifar10's OOD donor pool.
+                simclr_domains = ['mnist', 'mnist_m', 'svhn', 'syn', 'usps']
+                logger.info("Adversary pretraining SimCLR (digits/32x32) on %s (distance=%s)" % (simclr_domains, args.bd_distance))
+                print("Adversary pretraining SimCLR (digits/32x32, distance=%s) ..." % args.bd_distance)
+                encoder = pretrain_simclr_digits(args, simclr_domains, logger=logger)
+                classifier = train_adv_classifier(encoder, args, simclr_domains, logger=logger) \
+                    if args.bd_distance == 'pred_kl' else None
+                extractor = AdversaryExtractor(encoder, classifier)
+            elif args.dataset == 'domain':
+                # DomainNet gets its own natural-image SimCLR (ResNet18 backbone),
+                # pretrained on all DomainNet domains at bd_simclr_img_size.
+                sz = args.bd_simclr_img_size
+                simclr_domains = ['clipart', 'infograph', 'painting', 'quickdraw', 'real', 'sketch']
+                logger.info("Adversary pretraining SimCLR (DomainNet/%dx%d) on %s (distance=%s)" % (sz, sz, simclr_domains, args.bd_distance))
+                print("Adversary pretraining SimCLR (DomainNet/%dx%d, distance=%s) ..." % (sz, sz, args.bd_distance))
+                encoder = pretrain_simclr_domain(args, simclr_domains, img_size=sz, logger=logger)
+                classifier = train_adv_classifier_domain(encoder, args, simclr_domains, img_size=sz, logger=logger) \
+                    if args.bd_distance == 'pred_kl' else None
+                extractor = AdversaryExtractor(
+                    encoder, classifier, img_size=sz,
+                    normalize=transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+            else:
+                raise NotImplementedError(
+                    "embed_kl / pred_kl are not supported for dataset='%s'" % args.dataset)
 
-        # --- clean-model baseline ---
+        # --- clean-model baseline: build the SAME backdoor test set but poison NO
+        #     client (data or model), so the reported ASR is the natural
+        #     false-trigger rate of a clean model (an honest lower bound) ---
         if args.bd_clean_baseline:
             logger.info("CLEAN BASELINE: training a clean model, reporting baseline ASR on the CDLS test set")
             print("CLEAN BASELINE: no training client is poisoned; reporting baseline ASR")
-            adv_clients = []  
+            adv_clients = []  # emptied -> no data poisoning and no model poisoning; test set still built below
 
-        logger.info("Building CDLS backdoor (target_label=%s, partition=%s, adv_clients=%s, distance=%s)"
-                    % (str(args.bd_target_label), str(args.bd_partition), str(adv_clients), args.bd_distance))
+        logger.info("Building CDLS backdoor (dataset=%s, victim=%s, donors=%s, target_label=%s, partition=%s, adv_clients=%s, distance=%s)"
+                    % (args.dataset, str(victim_domain), str(donor_domains), str(args.bd_target_label),
+                       str(args.bd_partition), str(adv_clients), args.bd_distance))
 
-        client2loaders, test_dl, backdoor_test_dl, train_poison_dl = build_digits_backdoor(
+        # Build poisoned train loaders for the malicious clients + adversary test set
+        client2loaders, test_dl, backdoor_test_dl, train_poison_dl = build_cdls_backdoor(
             args, client2dataidx, adv_clients, args.bd_target_label, args.bd_partition,
-            domain=args.bd_domain, donor_domains=donor_domains,
+            dataset=args.dataset, domain=victim_domain, donor_domains=donor_domains,
             donor_pool_size=args.bd_donor_pool_size, max_search=args.bd_max_search, seed=args.init_seed,
             distance_mode=args.bd_distance, extractor=extractor)
 
@@ -208,6 +258,7 @@ if __name__ == "__main__":
                                                     train_bs = args.batch_size, test_bs = args.batch_size)
     
 
+    # Random client sampling support
     clients_per_round = int(args.nclients * args.fraction)
     client_ls = [i for i in range(args.nclients)]
     client_ls_rounds = []
@@ -229,22 +280,27 @@ if __name__ == "__main__":
     for comm_round in range(args.nrounds):
         logger.info("Communication round %d" % comm_round)
 
-        # local training on all selected clients
+        # local training on all selected clients (malicious ones may add a stealth
+        # regularizer when --bd_model_poison is set)
         nets_current = fedavg_local(args, global_net, logger, client2nets, client2loaders,
                                     client_ls_rounds, comm_round, test_dl, adv_clients=adv_clients)
 
-        # optional model-poisoning
+        # optional model-poisoning: constrain-and-scale the malicious updates so
+        # they survive robust aggregation (Multi-Krum / FLAME)
         if args.adv_type == 'CDLS' and args.bd_model_poison and adv_clients:
             round_adv = [c for c in adv_clients if c in nets_current]
             if round_adv:
                 apply_model_poison_constraint(global_net, nets_current, round_adv, scale=args.bd_scale)
 
+        # global aggregation (dispatch on the chosen rule)
         if args.aggregation == 'krum':
             krum(global_net, client2loaders, nets_current, nbyz=args.nbyz, m=args.krum_m)
         elif args.aggregation == 'flame':
             flame(global_net, client2loaders, nets_current)
-        elif args.aggregation == 'trim':
-            trimmed_mean(global_net, client2loaders, nets_current, b=args.nbyz)
+        elif args.aggregation == 'ndc':
+            ndc(global_net, client2loaders, nets_current)
+        elif args.aggregation == 'graid':
+            graid_aggregate(args, global_net, nets_current, client2loaders, comm_round, logger)
         else:
             fedavg_global(global_net, client2loaders, nets_current)
 

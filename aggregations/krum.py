@@ -40,4 +40,5 @@ def krum(global_net, client2loaders, nets_this_round, nbyz=0, m=1):
         else:
             for key in net_para:
                 w_global[key] += net_para[key] * fed_avg_freqs[net_id]
+                
     global_net.load_state_dict(w_global)
