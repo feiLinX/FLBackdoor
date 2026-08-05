@@ -118,33 +118,6 @@ def _load_cdls_raw_images(args, dataset, domain, dataidxs, train=True):
     return images, labels
 
 
-def get_digits_transforms(args):
-
-    normalize = transforms.Normalize((0.1307,), (0.3081,))
-    transform_train = [
-        transforms.ToPILImage(),
-        transforms.Resize((36, 36)),
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-    ]
-
-    if args.auto_aug:
-        transform_train.append(AutoAugment())
-
-    transform_train.extend([
-        transforms.ToTensor(),
-        normalize,
-    ])
-    transform_train = transforms.Compose(transform_train)
-
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        normalize,
-    ])
-
-    return transform_train, transform_test
-
-
 # ---------------------------- Embedding-KLD and Prediction-KLD ----------------------------
 class ProjectionHead(nn.Module):
     def __init__(self, in_dim=512, hidden_dim=512, out_dim=128):
@@ -237,6 +210,7 @@ def get_simclr_transform():
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,)),
     ])
+
 
 def get_simclr_transform_domain(img_size=96):
 
@@ -509,10 +483,30 @@ def poison_label_swap(images, labels, target_label, partition, donor_pool,
 
 
 def get_cdls_transforms(args, dataset):
-    """(transform_train, transform_test) used to wrap the in-memory poisoned data
-    so it matches the standard pipeline of `dataset` (mirrors get_dataloader)."""
+
     if dataset == 'digits':
-        return get_digits_transforms(args)
+        normalize = transforms.Normalize((0.1307,), (0.3081,))
+        transform_train = [
+            transforms.ToPILImage(),
+            transforms.Resize((36, 36)),
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+        ]
+        if args.auto_aug:
+            transform_train.append(AutoAugment())
+
+        transform_train.extend([
+            transforms.ToTensor(),
+            normalize,
+        ])
+        transform_train = transforms.Compose(transform_train)
+
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            normalize,
+        ])
+        return transform_train, transform_test
+    
     elif dataset == 'cifar10':
         normalize = transforms.Normalize(mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
                                           std=[x / 255.0 for x in [63.0, 62.1, 66.7]])
@@ -523,6 +517,7 @@ def get_cdls_transforms(args, dataset):
             tt.append(AutoAugment())
         tt += [transforms.ToTensor(), normalize]
         return transforms.Compose(tt), transforms.Compose([transforms.ToTensor(), normalize])
+    
     elif dataset == 'domain':
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         tt = [transforms.ToPILImage(),
@@ -536,6 +531,7 @@ def get_cdls_transforms(args, dataset):
                                              transforms.Resize((224, 224)),
                                              transforms.ToTensor(), normalize])
         return transforms.Compose(tt), transform_test
+    
     else:
         raise ValueError("CDLS not supported for dataset: %s" % dataset)
 
@@ -570,7 +566,7 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
             replaced_idx = poison_label_swap(images, labels, target_label, partition, train_donor_pool,
                                              max_search=max_search, threshold=threshold, seed=seed + client_id,
                                              distance_mode=distance_mode, extractor=extractor,
-                                             donor_reprs=train_donor_reprs, dataset=dataset)
+                                             donor_reprs=train_donor_reprs)
             # keep the literal poisoned (image, label) pairs for the train_asr diagnostic
             train_poison_images.extend(images[i] for i in replaced_idx)
             train_poison_labels.extend(labels[i] for i in replaced_idx)
@@ -608,7 +604,7 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
     replaced_idx = poison_label_swap(test_images, test_labels, target_label, partition, test_donor_pool,
                                       max_search=max_search, threshold=threshold, seed=seed + 10_000,
                                       distance_mode=distance_mode, extractor=extractor,
-                                      donor_reprs=test_donor_reprs, dataset=dataset)
+                                      donor_reprs=test_donor_reprs)
     replaced_set = set(replaced_idx)
 
     clean_idx = [i for i in range(len(test_labels)) if i not in replaced_set]
