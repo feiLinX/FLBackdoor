@@ -31,7 +31,7 @@ def args_parser():
     # FL
     parser.add_argument("--aggregation", help="aggregation rule", default='graid', type=str,
                         choices=['fedavg', 'krum', 'flame', 'ndc', 'graid'])
-    parser.add_argument("--nrounds", help="# global rounds", default=60, type=int)
+    parser.add_argument("--nrounds", help="# global rounds", default=100, type=int)
     parser.add_argument("--epochs", help="# local epochs", default=5, type=int)
     parser.add_argument("--nclients", help="# clients", default=20, type=int)
     parser.add_argument("--fraction", help="fraction of clients", default=1.0, type=float)
