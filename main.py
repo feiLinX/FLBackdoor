@@ -11,7 +11,7 @@ from models import ResNet18, ResNet34, ResNet50, ResNet18Small, ResNet34Small, R
 from attacks.cdls import CDLS_CONFIG, build_cdls_backdoor, pretrain_simclr_digits, pretrain_simclr_domain, train_adv_classifier, train_adv_classifier_domain, AdversaryExtractor, apply_model_poison_constraint
 from defenses.graid import graid_aggregate
 from data_aug_utils import AutoAugment
-from aggregations import fedavg_local, fedavg_global, flame, krum, ndc
+from aggregations import fedavg_local, fedavg_global, flame, krum, ndc, deepsight, foolsgold, bnguard
 
 
 def args_parser():
@@ -30,7 +30,7 @@ def args_parser():
 
     # FL
     parser.add_argument("--aggregation", help="aggregation rule", default='graid', type=str,
-                        choices=['fedavg', 'krum', 'flame', 'ndc', 'graid'])
+                        choices=['fedavg', 'krum', 'flame', 'ndc', 'graid', 'deepsight', 'foolsgold', 'bnguard'])
     parser.add_argument("--nrounds", help="# global rounds", default=100, type=int)
     parser.add_argument("--epochs", help="# local epochs", default=5, type=int)
     parser.add_argument("--nclients", help="# clients", default=20, type=int)
@@ -301,6 +301,12 @@ if __name__ == "__main__":
             ndc(global_net, client2loaders, nets_current)
         elif args.aggregation == 'graid':
             graid_aggregate(args, global_net, nets_current, client2loaders, comm_round, logger)
+        elif args.aggregation == 'foolsgold':
+            foolsgold(global_net, client2loaders, nets_current)
+        elif args.aggregation == 'deepsight':
+            deepsight(global_net, client2loaders, nets_current)
+        elif args.aggregation == 'bnguard':
+            bnguard(global_net, client2loaders, nets_current)
         else:
             fedavg_global(global_net, client2loaders, nets_current)
 
