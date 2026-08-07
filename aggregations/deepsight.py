@@ -82,6 +82,7 @@ def deepsight(global_net, client2loaders, nets_this_round,
         return pd
 
     def _cluster(x):
+        x = np.nan_to_num(np.asarray(x, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
         return HDBSCAN(min_samples=1, allow_single_cluster=True).fit_predict(x)
 
     cosine_dists = _dists_from_clust(_cluster(cosine_distance))
