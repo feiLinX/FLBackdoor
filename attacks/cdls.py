@@ -608,15 +608,25 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
     replaced_set = set(replaced_idx)
 
     clean_idx = [i for i in range(len(test_labels)) if i not in replaced_set]
+    clean_imgs, clean_lbls = [test_images[i] for i in clean_idx], [test_labels[i] for i in clean_idx]
+    bd_imgs, bd_lbls = [test_images[i] for i in replaced_idx], [test_labels[i] for i in replaced_idx]
+
+    # DomainNet/Office: tile the raw test set ×aug_mult, mirroring the train-side aug_mult.
+    # Tiled copies use the stochastic train transform (test-time augmentation) so each copy is a
+    # distinct augmented view; the deterministic test transform would otherwise just duplicate images.
+    test_tf = transform_test
+    if dataset in ('domain', 'office') and args.aug_mult > 1:
+        clean_imgs, clean_lbls = clean_imgs * args.aug_mult, clean_lbls * args.aug_mult
+        bd_imgs, bd_lbls = bd_imgs * args.aug_mult, bd_lbls * args.aug_mult
+        test_tf = transform_train
+
     clean_test_dl = DataLoader(
-        InMemoryImageDataset([test_images[i] for i in clean_idx], [test_labels[i] for i in clean_idx],
-                             transform=transform_test),
+        InMemoryImageDataset(clean_imgs, clean_lbls, transform=test_tf),
         batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    if replaced_idx:
+    if bd_imgs:
         backdoor_test_dl = DataLoader(
-            InMemoryImageDataset([test_images[i] for i in replaced_idx], [test_labels[i] for i in replaced_idx],
-                                 transform=transform_test),
+            InMemoryImageDataset(bd_imgs, bd_lbls, transform=test_tf),
             batch_size=args.batch_size, shuffle=False, num_workers=4)
     else:
         backdoor_test_dl = None

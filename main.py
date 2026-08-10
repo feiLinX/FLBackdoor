@@ -21,7 +21,7 @@ def args_parser():
                         choices=['digits', 'office', 'domain', 'cifar10', 'cifar100'])
     parser.add_argument("--model", help="training model", default="resnet34", type=str,
                         choices=['cnn','resnet18', 'resnet34', 'resnet50', 'mobilenetv2'])
-    parser.add_argument("--lr", help="learning rate", default=5e-4, type=float)
+    parser.add_argument("--lr", help="learning rate", default=1e-3, type=float)
     parser.add_argument("--momentum", help="SGD momentum", default=0.9, type=float)
     parser.add_argument("--wd", help="weight decay", default=1e-5, type=float)
     parser.add_argument("--batch_size", help="batch size", default=64, type=int)
@@ -119,9 +119,9 @@ def init_model(nclients, args):
         elif args.model == 'resnet34':
             net = ResNet34Small() if small_input else ResNet34()
         elif args.model == 'resnet50':
-            net = ResNet50Small() if small_input else ResNet50()
+            net = ResNet50Small() if small_input else ResNet50(pretrained=True)
         elif args.model == 'mobilenetv2':
-            net = MobileNetV2() if small_input else MobileNetV2Large()
+            net = MobileNetV2() if small_input else MobileNetV2Large(pretrained=True)
         else:
             raise NotImplementedError("model not implemented")
         nets[net_i] = net
