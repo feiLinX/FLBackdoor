@@ -31,7 +31,7 @@ def args_parser():
     # FL
     parser.add_argument("--aggregation", help="aggregation rule", default='graid', type=str,
                         choices=['fedavg', 'krum', 'flame', 'ndc', 'graid', 'deepsight', 'foolsgold', 'bnguard'])
-    parser.add_argument("--nrounds", help="# global rounds", default=100, type=int)
+    parser.add_argument("--nrounds", help="# global rounds", default=70, type=int)
     parser.add_argument("--epochs", help="# local epochs", default=5, type=int)
     parser.add_argument("--nclients", help="# clients", default=20, type=int)
     parser.add_argument("--fraction", help="fraction of clients", default=1.0, type=float)
@@ -119,9 +119,9 @@ def init_model(nclients, args):
         elif args.model == 'resnet34':
             net = ResNet34Small() if small_input else ResNet34()
         elif args.model == 'resnet50':
-            net = ResNet50Small() if small_input else ResNet50(pretrained=True)
+            net = ResNet50Small() if small_input else ResNet50()
         elif args.model == 'mobilenetv2':
-            net = MobileNetV2() if small_input else MobileNetV2Large(pretrained=True)
+            net = MobileNetV2() if small_input else MobileNetV2Large()
         else:
             raise NotImplementedError("model not implemented")
         nets[net_i] = net

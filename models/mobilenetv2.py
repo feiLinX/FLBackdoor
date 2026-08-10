@@ -4,8 +4,6 @@ import torch.nn.functional as F
 import torchvision
 
 
-__all__ = ['MobileNetV2']
-
 class Block(nn.Module):
     '''expand + depthwise + pointwise'''
     def __init__(self, in_planes, out_planes, expansion, stride):

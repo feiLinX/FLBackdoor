@@ -601,7 +601,9 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
 
     test_images, test_labels = _load_cdls_raw_images(args, dataset, domain, None, train=False)
 
-    replaced_idx = poison_label_swap(test_images, test_labels, target_label, partition, test_donor_pool,
+    test_partition = 0.5 if dataset == 'domain' else partition
+
+    replaced_idx = poison_label_swap(test_images, test_labels, target_label, test_partition, test_donor_pool,
                                       max_search=max_search, threshold=threshold, seed=seed + 10_000,
                                       distance_mode=distance_mode, extractor=extractor,
                                       donor_reprs=test_donor_reprs)
@@ -611,22 +613,18 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
     clean_imgs, clean_lbls = [test_images[i] for i in clean_idx], [test_labels[i] for i in clean_idx]
     bd_imgs, bd_lbls = [test_images[i] for i in replaced_idx], [test_labels[i] for i in replaced_idx]
 
-    # DomainNet/Office: tile the raw test set ×aug_mult, mirroring the train-side aug_mult.
-    # Tiled copies use the stochastic train transform (test-time augmentation) so each copy is a
-    # distinct augmented view; the deterministic test transform would otherwise just duplicate images.
-    test_tf = transform_test
+    # DomainNet/Office: tile the raw test set ×aug_mult, mirroring the train-side aug_mult
     if dataset in ('domain', 'office') and args.aug_mult > 1:
         clean_imgs, clean_lbls = clean_imgs * args.aug_mult, clean_lbls * args.aug_mult
         bd_imgs, bd_lbls = bd_imgs * args.aug_mult, bd_lbls * args.aug_mult
-        test_tf = transform_train
 
     clean_test_dl = DataLoader(
-        InMemoryImageDataset(clean_imgs, clean_lbls, transform=test_tf),
+        InMemoryImageDataset(clean_imgs, clean_lbls, transform=transform_test),
         batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     if bd_imgs:
         backdoor_test_dl = DataLoader(
-            InMemoryImageDataset(bd_imgs, bd_lbls, transform=test_tf),
+            InMemoryImageDataset(bd_imgs, bd_lbls, transform=transform_test),
             batch_size=args.batch_size, shuffle=False, num_workers=4)
     else:
         backdoor_test_dl = None
