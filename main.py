@@ -9,6 +9,8 @@ from utils import *
 from data_utils import *
 from models import ResNet18, ResNet34, ResNet50, ResNet18Small, ResNet34Small, ResNet50Small, MobileNetV2, MobileNetV2Large, FangCNN
 from attacks.cdls import CDLS_CONFIG, build_cdls_backdoor, pretrain_simclr_digits, pretrain_simclr_domain, train_adv_classifier, train_adv_classifier_domain, AdversaryExtractor, apply_model_poison_constraint
+from attacks.pgd import build_trigger_backdoor
+from attacks.neurotoxin import compute_neurotoxin_mask
 from defenses.graid import graid_aggregate
 from data_aug_utils import AutoAugment
 from aggregations import fedavg_local, fedavg_global, flame, krum, ndc, deepsight, foolsgold, bnguard
@@ -21,7 +23,7 @@ def args_parser():
                         choices=['digits', 'office', 'domain', 'cifar10', 'cifar100'])
     parser.add_argument("--model", help="training model", default="resnet34", type=str,
                         choices=['cnn','resnet18', 'resnet34', 'resnet50', 'mobilenetv2'])
-    parser.add_argument("--lr", help="learning rate", default=1e-3, type=float)
+    parser.add_argument("--lr", help="learning rate", default=2e-3, type=float)
     parser.add_argument("--momentum", help="SGD momentum", default=0.9, type=float)
     parser.add_argument("--wd", help="weight decay", default=1e-5, type=float)
     parser.add_argument("--batch_size", help="batch size", default=64, type=int)
@@ -31,9 +33,9 @@ def args_parser():
     # FL
     parser.add_argument("--aggregation", help="aggregation rule", default='graid', type=str,
                         choices=['fedavg', 'krum', 'flame', 'ndc', 'graid', 'deepsight', 'foolsgold', 'bnguard'])
-    parser.add_argument("--nrounds", help="# global rounds", default=70, type=int)
+    parser.add_argument("--nrounds", help="# global rounds", default=80, type=int)
     parser.add_argument("--epochs", help="# local epochs", default=5, type=int)
-    parser.add_argument("--nclients", help="# clients", default=20, type=int)
+    parser.add_argument("--nclients", help="# clients", default=10, type=int)
     parser.add_argument("--fraction", help="fraction of clients", default=1.0, type=float)
     parser.add_argument("--bias", help="degree of label non-iidness", default=1, type=float)
     parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
@@ -59,7 +61,7 @@ def args_parser():
 
     # Adversarial
     parser.add_argument("--adv_type", help="adv type", default='None', type=str,
-                        choices=['None', 'CDLS'])
+                        choices=['None', 'CDLS', 'PGD', 'Neurotoxin'])
     parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=4, type=int)
     parser.add_argument("--bd_target_label", help="original label targeted by the CDLS backdoor", default=0, type=int)
     parser.add_argument("--bd_partition", help="fraction of a client's target_label samples to replace with the nearest cross-domain donor sample", default=0.5, type=float)
@@ -83,6 +85,14 @@ def args_parser():
     parser.add_argument("--bd_model_poison", help="enable model-poisoning on top of CDLS data poisoning (stealth reg + constrain-and-scale)", action='store_true')
     parser.add_argument("--bd_stealth_lambda", help="weight of the ||w - w_global||^2 stealth/anomaly-evasion regularizer on malicious clients", default=1e-3, type=float)
     parser.add_argument("--bd_scale", help="malicious update scaling factor for constrain-and-scale (capped at the benign median update norm)", default=2.0, type=float)
+
+    # PGD (Attack of the Tails, Wang et al. 2020) & Neurotoxin (Zhang et al. 2022):
+    # trigger-backdoor model-poisoning baselines. They reuse --bd_target_label
+    # (trigger target) and --bd_partition (poison fraction).
+    parser.add_argument("--bd_trigger_size", help="PGD/Neurotoxin: side length (px) of the square corner trigger", default=5, type=int)
+    parser.add_argument("--bd_trigger_value", help="PGD/Neurotoxin: pixel value stamped for the trigger", default=255, type=int)
+    parser.add_argument("--pgd_eps", help="PGD: L2 radius of the ball around the global model the malicious weights are projected into after every optimizer step", default=1.0, type=float)
+    parser.add_argument("--neuro_mask_ratio", help="Neurotoxin: fraction of top benign-gradient coordinates malicious clients FREEZE (the backdoor is trained on the remaining coords)", default=0.1, type=float)
 
     # Logging
     parser.add_argument("--data_dir", type=str, required=False, default="/scratch/jmh8504/data/", 
@@ -224,9 +234,7 @@ if __name__ == "__main__":
                 raise NotImplementedError(
                     "embed_kl / pred_kl are not supported for dataset='%s'" % args.dataset)
 
-        # --- clean-model baseline: build the SAME backdoor test set but poison NO
-        #     client (data or model), so the reported ASR is the natural
-        #     false-trigger rate of a clean model (an honest lower bound) ---
+        # --- clean-model baseline ---
         if args.bd_clean_baseline:
             logger.info("CLEAN BASELINE: training a clean model, reporting baseline ASR on the CDLS test set")
             print("CLEAN BASELINE: no training client is poisoned; reporting baseline ASR")
@@ -245,6 +253,37 @@ if __name__ == "__main__":
 
         global_train_dl, _ = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
                                          train_bs=args.batch_size, test_bs=args.batch_size)
+        
+    elif args.adv_type in ('PGD', 'Neurotoxin'):
+            # PGD / Neurotoxin: shared pattern-trigger backdoor (same 4-tuple as CDLS), so
+            # the training/eval loop below is identical; they differ only in the malicious
+            # update shaping applied in fedavg_local (PGD projection / Neurotoxin masking).
+            adv_clients = list(range(args.nbyz))
+    
+            if args.dataset == 'digits':
+                victim_domain = args.bd_domain
+            elif args.dataset == 'domain':
+                victim_domain = 'clipart'
+            else:
+                victim_domain = None
+    
+            if args.bd_clean_baseline:
+                logger.info("CLEAN BASELINE: training a clean model, reporting baseline ASR on the trigger test set")
+                print("CLEAN BASELINE: no training client is poisoned; reporting baseline ASR")
+                adv_clients = []
+    
+            logger.info("Building %s trigger backdoor (dataset=%s, victim=%s, target_label=%s, poison_frac=%s, trigger_size=%d, adv_clients=%s)"
+                        % (args.adv_type, args.dataset, str(victim_domain), str(args.bd_target_label),
+                           str(args.bd_partition), args.bd_trigger_size, str(adv_clients)))
+    
+            client2loaders, test_dl, backdoor_test_dl, train_poison_dl = build_trigger_backdoor(
+                args, client2dataidx, adv_clients, args.bd_target_label, args.bd_partition,
+                dataset=args.dataset, domain=victim_domain, trigger_size=args.bd_trigger_size,
+                trigger_value=args.bd_trigger_value, seed=args.init_seed)
+    
+            global_train_dl, _ = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
+                                             train_bs=args.batch_size, test_bs=args.batch_size)
+            
     elif args.adv_type == 'None':
         logger.info("No attack selected; training on clean data only")
 
@@ -280,14 +319,18 @@ if __name__ == "__main__":
     for comm_round in range(args.nrounds):
         logger.info("Communication round %d" % comm_round)
 
-        # local training on all selected clients (malicious ones may add a stealth
-        # regularizer when --bd_model_poison is set)
+        neuro_mask = None
+        if args.adv_type == 'Neurotoxin' and adv_clients:
+            neuro_mask = compute_neurotoxin_mask(global_net, global_train_dl, args.neuro_mask_ratio)
+
+        # local training on all selected clients; malicious ones add the attack-specific
+        # update shaping (CDLS stealth reg / PGD projection / Neurotoxin gradient mask)
         nets_current = fedavg_local(args, global_net, logger, client2nets, client2loaders,
-                                    client_ls_rounds, comm_round, test_dl, adv_clients=adv_clients)
+                                    client_ls_rounds, comm_round, test_dl, adv_clients=adv_clients, neuro_mask=neuro_mask)
 
         # optional model-poisoning: constrain-and-scale the malicious updates so
         # they survive robust aggregation (Multi-Krum / FLAME)
-        if args.adv_type == 'CDLS' and args.bd_model_poison and adv_clients:
+        if args.adv_type in ('CDLS', 'PGD', 'Neurotoxin') and args.bd_model_poison and adv_clients:
             round_adv = [c for c in adv_clients if c in nets_current]
             if round_adv:
                 apply_model_poison_constraint(global_net, nets_current, round_adv, scale=args.bd_scale)
@@ -314,7 +357,7 @@ if __name__ == "__main__":
         global_net.cuda()
         train_acc, train_loss = compute_accuracy(global_net, global_train_dl)
 
-        if args.adv_type == 'CDLS':
+        if args.adv_type in ('CDLS', 'PGD', 'Neurotoxin'):
             test_acc, asr, train_asr = evaluate_acc_asr(global_net, test_dl, backdoor_test_dl, train_poison_dl)
             global_net.to('cpu')
 

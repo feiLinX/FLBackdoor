@@ -1,10 +1,12 @@
 import os
 import sys
+import torch
 import torch.nn as nn
 import torch.optim as optim
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import compute_accuracy
+from attacks.pgd import pgd_project_
 
 
 def fedavg_global(global_net, client2loaders, nets_this_round):
@@ -23,26 +25,38 @@ def fedavg_global(global_net, client2loaders, nets_this_round):
     global_net.load_state_dict(w_global)
 
 
-def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_ls_rounds, comm_round, test_dl, adv_clients=None):
+def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_ls_rounds, comm_round, test_dl, adv_clients=None, neuro_mask=None):
     # local training on all selected clients
     client_ls_current = client_ls_rounds[comm_round]
     nets_current = {k: client2nets[k] for k in client_ls_current}
 
     adv_clients = set(adv_clients) if adv_clients is not None else set()
     model_poison = getattr(args, 'bd_model_poison', False)
+    attack = getattr(args, 'adv_type', 'None')
 
     # distribute the global model
     w_global = global_net.state_dict()
     for net in nets_current.values():
         net.load_state_dict(w_global)
+
+    # pre-round global trainable-param vector (PGD projects malicious weights back into
+    # an L2 pgd_eps-ball around it after every optimizer step)
+    global_vec = None
+    if attack == 'PGD':
+        global_vec = torch.nn.utils.parameters_to_vector([p.detach() for p in global_net.parameters()]).detach().cuda()
     
     for client_idx in nets_current:
         net = client2nets[client_idx]
         net.train()
         net.cuda()
 
-        is_adv = model_poison and (client_idx in adv_clients) and args.bd_stealth_lambda > 0
-        ref_params = [p.detach().clone() for p in net.parameters()] if is_adv else None
+        # attack-specific malicious update shaping (only for the nbyz malicious clients)
+        is_mal = client_idx in adv_clients
+        cdls_stealth = is_mal and model_poison and attack == 'CDLS' and args.bd_stealth_lambda > 0
+        pgd = is_mal and attack == 'PGD'
+        neuro = is_mal and attack == 'Neurotoxin' and neuro_mask is not None
+        ref_params = [p.detach().clone() for p in net.parameters()] if cdls_stealth else None
+        mask_cuda = [m.cuda() for m in neuro_mask] if neuro else None
 
         train_loader = client2loaders[client_idx]
         test_loader = test_dl
@@ -67,12 +81,23 @@ def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_l
                 out, features = net(x, return_features=True)
                 loss = criterion(out, target)
 
-                # Add regularization term to the loss if the client is adversarial
-                if is_adv:
+                # CDLS stealth / anomaly-evasion regularizer
+                if cdls_stealth:
                     reg = sum(((p - r) ** 2).sum() for p, r in zip(net.parameters(), ref_params))
                     loss = loss + args.bd_stealth_lambda * reg
                 loss.backward()
+
+                # Neurotoxin: zero the gradient on the coords benign clients update most
+                if neuro:
+                    for p, m in zip(net.parameters(), mask_cuda):
+                        if p.grad is not None:
+                            p.grad.mul_(m)
                 optimizer.step()
+
+                # PGD: project malicious weights back into the L2 pgd_eps-ball around w_global
+                if pgd:
+                    pgd_project_(net, global_vec, args.pgd_eps)
+
                 loss_ls.append(loss.item())
             
             epoch_loss = sum(loss_ls) / len(loss_ls)
