@@ -11,6 +11,8 @@ from models import ResNet18, ResNet34, ResNet50, ResNet18Small, ResNet34Small, R
 from attacks.cdls import CDLS_CONFIG, build_cdls_backdoor, pretrain_simclr_digits, pretrain_simclr_domain, train_adv_classifier, train_adv_classifier_domain, AdversaryExtractor, apply_model_poison_constraint
 from attacks.pgd import build_trigger_backdoor
 from attacks.neurotoxin import compute_neurotoxin_mask
+from attacks.vanilla import apply_model_replacement
+from attacks.soda import build_soda_backdoor
 from defenses.graid import graid_aggregate
 from data_aug_utils import AutoAugment
 from aggregations import fedavg_local, fedavg_global, flame, krum, ndc, deepsight, foolsgold, bnguard
@@ -23,9 +25,11 @@ def args_parser():
                         choices=['digits', 'office', 'domain', 'cifar10', 'cifar100'])
     parser.add_argument("--model", help="training model", default="resnet34", type=str,
                         choices=['cnn','resnet18', 'resnet34', 'resnet50', 'mobilenetv2'])
-    parser.add_argument("--lr", help="learning rate", default=2e-3, type=float)
+    parser.add_argument("--lr", help="learning rate", default=2e-3, type=float,
+                        choices=[1e-3, 5e-4])
     parser.add_argument("--momentum", help="SGD momentum", default=0.9, type=float)
-    parser.add_argument("--wd", help="weight decay", default=1e-5, type=float)
+    parser.add_argument("--wd", help="weight decay", default=1e-5, type=float,
+                        choices=[5e-3, 1e-5])
     parser.add_argument("--batch_size", help="batch size", default=64, type=int)
     parser.add_argument('--device', help="cpu, cuda", default="cuda", type=str)
     parser.add_argument("--gpu", help="index of gpu", default=0, type=int)
@@ -35,7 +39,7 @@ def args_parser():
                         choices=['fedavg', 'krum', 'flame', 'ndc', 'graid', 'deepsight', 'foolsgold', 'bnguard'])
     parser.add_argument("--nrounds", help="# global rounds", default=80, type=int)
     parser.add_argument("--epochs", help="# local epochs", default=5, type=int)
-    parser.add_argument("--nclients", help="# clients", default=10, type=int)
+    parser.add_argument("--nclients", help="# clients", default=20, type=int)
     parser.add_argument("--fraction", help="fraction of clients", default=1.0, type=float)
     parser.add_argument("--bias", help="degree of label non-iidness", default=1, type=float)
     parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
@@ -57,11 +61,12 @@ def args_parser():
     parser.add_argument("--def_recon_every", help="GRAID: run reconstruction+filtering every K rounds (1=every round); the other rounds fall back to plain FedAvg over all clients to save compute", default=3, type=int)
     parser.add_argument("--def_warmup", help="GRAID: # initial warm-up rounds during which GRAID does NOT screen (all clients are FedAvg-aggregated); 0 = no warm-up, GRAID active from round 0", default=0, type=int)
     parser.add_argument("--def_min_cluster", help="GRAID: min reconstructed samples of a class needed to attempt a within-class split", default=6, type=int)
+    parser.add_argument("--def_sep_ratio", help="GRAID: accept a KMeans 2-way split only if (inter-centroid distance)/(mean intra-cluster radius) exceeds this; larger = stricter (fewer splits). ~1.5 for a homogeneous blob, >=7 for a genuine split", default=3.0, type=float)
     parser.add_argument("--def_susp_threshold", help="GRAID: discard a client if this fraction of its reconstructions is suspicious", default=0.3, type=float)
 
     # Adversarial
     parser.add_argument("--adv_type", help="adv type", default='None', type=str,
-                        choices=['None', 'CDLS', 'PGD', 'Neurotoxin'])
+                        choices=['None', 'CDLS', 'PGD', 'Neurotoxin', 'Vanilla', 'Chameleon', 'SoDa'])
     parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=4, type=int)
     parser.add_argument("--bd_target_label", help="original label targeted by the CDLS backdoor", default=0, type=int)
     parser.add_argument("--bd_partition", help="fraction of a client's target_label samples to replace with the nearest cross-domain donor sample", default=0.5, type=float)
@@ -93,6 +98,15 @@ def args_parser():
     parser.add_argument("--bd_trigger_value", help="PGD/Neurotoxin: pixel value stamped for the trigger", default=255, type=int)
     parser.add_argument("--pgd_eps", help="PGD: L2 radius of the ball around the global model the malicious weights are projected into after every optimizer step", default=1.0, type=float)
     parser.add_argument("--neuro_mask_ratio", help="Neurotoxin: fraction of top benign-gradient coordinates malicious clients FREEZE (the backdoor is trained on the remaining coords)", default=0.1, type=float)
+
+    # Vanilla (Bagdasaryan et al. 2020), Chameleon (Dai et al. 2023) & SoDa (OOD +
+    # self-reference) baselines. Vanilla/Chameleon reuse the pattern trigger + model
+    # poisoning; SoDa uses OOD data. All reuse --bd_target_label / --bd_partition.
+    parser.add_argument("--chameleon_lambda", help="Chameleon: weight of the supervised-contrastive (peer-adaptation) loss on malicious clients", default=1.0, type=float)
+    parser.add_argument("--chameleon_temp", help="Chameleon: temperature of the supervised-contrastive loss", default=0.5, type=float)
+    parser.add_argument("--soda_ood", help="SoDa: OOD dataset the backdoor images are drawn from (default: cifar10 for non-cifar victims, digits for cifar10)", default=None, type=str, choices=['cifar10', 'digits'])
+    parser.add_argument("--soda_l2", help="SoDa: weight of the ||w - self_reference||_2 term on malicious clients", default=0.1, type=float)
+    parser.add_argument("--soda_cos", help="SoDa: weight of the (1 - cos(w, self_reference)) term on malicious clients", default=100.0, type=float)
 
     # Logging
     parser.add_argument("--data_dir", type=str, required=False, default="/scratch/jmh8504/data/", 
@@ -184,6 +198,7 @@ if __name__ == "__main__":
                                      n_clients=args.nclients, alpha=args.bias)
 
     adv_clients = []  # the single malicious-client list (data + model poisoning); empty for clean / no-attack runs
+    client2clean_loaders = None  # SoDa: malicious clients' un-poisoned loaders (self-reference stage)
 
     if args.adv_type == 'CDLS':
         if args.dataset not in CDLS_CONFIG:
@@ -254,10 +269,12 @@ if __name__ == "__main__":
         global_train_dl, _ = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
                                          train_bs=args.batch_size, test_bs=args.batch_size)
         
-    elif args.adv_type in ('PGD', 'Neurotoxin'):
-            # PGD / Neurotoxin: shared pattern-trigger backdoor (same 4-tuple as CDLS), so
-            # the training/eval loop below is identical; they differ only in the malicious
-            # update shaping applied in fedavg_local (PGD projection / Neurotoxin masking).
+    elif args.adv_type in ('PGD', 'Neurotoxin', 'Vanilla', 'Chameleon'):
+            # PGD / Neurotoxin / Vanilla / Chameleon: shared pattern-trigger backdoor (same
+            # 4-tuple as CDLS), so the training/eval loop below is identical; they differ
+            # only in the malicious update shaping in fedavg_local (PGD projection /
+            # Neurotoxin masking / Chameleon supervised-contrastive) and the model-poisoning
+            # step (Vanilla -> uncapped model replacement; the others -> constrain-and-scale).
             adv_clients = list(range(args.nbyz))
     
             if args.dataset == 'digits':
@@ -284,6 +301,38 @@ if __name__ == "__main__":
             global_train_dl, _ = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
                                              train_bs=args.batch_size, test_bs=args.batch_size)
             
+    elif args.adv_type == 'SoDa':
+        # SoDa (soda src): OOD-data backdoor + self-reference stage. Malicious clients
+        # relabel a poison_frac of their samples to the target using out-of-distribution
+        # images; ASR is measured on OOD test images. The self-reference regulariser is
+        # applied in fedavg_local (it needs the malicious clients' clean loaders).
+        adv_clients = list(range(args.nbyz))
+        victim_domain = args.bd_domain if args.dataset == 'digits' else None
+
+        # OOD source: digits <- cifar10, cifar10 <- digits(mnist); overridable via --soda_ood
+        if args.soda_ood is not None:
+            ood_dataset = args.soda_ood
+        else:
+            ood_dataset = 'cifar10' if args.dataset != 'cifar10' else 'digits'
+        ood_domain = 'mnist' if ood_dataset == 'digits' else None
+
+        if args.bd_clean_baseline:
+            logger.info("CLEAN BASELINE: training a clean model, reporting baseline ASR on the SoDa OOD test set")
+            print("CLEAN BASELINE: no training client is poisoned; reporting baseline ASR")
+            adv_clients = []
+
+        logger.info("Building SoDa OOD backdoor (dataset=%s, victim=%s, ood=%s, target_label=%s, poison_frac=%s, adv_clients=%s)"
+                    % (args.dataset, str(victim_domain), ood_dataset, str(args.bd_target_label),
+                       str(args.bd_partition), str(adv_clients)))
+
+        client2loaders, test_dl, backdoor_test_dl, train_poison_dl, client2clean_loaders = build_soda_backdoor(
+            args, client2dataidx, adv_clients, args.bd_target_label, args.bd_partition,
+            dataset=args.dataset, domain=victim_domain, ood_dataset=ood_dataset, ood_domain=ood_domain,
+            seed=args.init_seed)
+
+        global_train_dl, _ = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
+                                         train_bs=args.batch_size, test_bs=args.batch_size)
+
     elif args.adv_type == 'None':
         logger.info("No attack selected; training on clean data only")
 
@@ -326,14 +375,20 @@ if __name__ == "__main__":
         # local training on all selected clients; malicious ones add the attack-specific
         # update shaping (CDLS stealth reg / PGD projection / Neurotoxin gradient mask)
         nets_current = fedavg_local(args, global_net, logger, client2nets, client2loaders,
-                                    client_ls_rounds, comm_round, test_dl, adv_clients=adv_clients, neuro_mask=neuro_mask)
+                                    client_ls_rounds, comm_round, test_dl, adv_clients=adv_clients,
+                                    neuro_mask=neuro_mask, clean_loaders=client2clean_loaders)
 
-        # optional model-poisoning: constrain-and-scale the malicious updates so
-        # they survive robust aggregation (Multi-Krum / FLAME)
-        if args.adv_type in ('CDLS', 'PGD', 'Neurotoxin') and args.bd_model_poison and adv_clients:
+        # optional model-poisoning on the malicious updates (SoDa does its own via the
+        # self-reference regulariser inside fedavg_local, so it is skipped here)
+        if args.bd_model_poison and adv_clients:
             round_adv = [c for c in adv_clients if c in nets_current]
             if round_adv:
-                apply_model_poison_constraint(global_net, nets_current, round_adv, scale=args.bd_scale)
+                if args.adv_type == 'Vanilla':
+                    # Bagdasaryan: uncapped model replacement (boost, no norm cap)
+                    apply_model_replacement(global_net, nets_current, round_adv, scale=args.bd_scale)
+                elif args.adv_type in ('CDLS', 'PGD', 'Neurotoxin', 'Chameleon'):
+                    # constrain-and-scale: boost yet norm-cap to survive robust aggregation
+                    apply_model_poison_constraint(global_net, nets_current, round_adv, scale=args.bd_scale)
 
         # global aggregation (dispatch on the chosen rule)
         if args.aggregation == 'krum':
@@ -357,7 +412,7 @@ if __name__ == "__main__":
         global_net.cuda()
         train_acc, train_loss = compute_accuracy(global_net, global_train_dl)
 
-        if args.adv_type in ('CDLS', 'PGD', 'Neurotoxin'):
+        if args.adv_type in ('CDLS', 'PGD', 'Neurotoxin', 'Vanilla', 'Chameleon', 'SoDa'):
             test_acc, asr, train_asr = evaluate_acc_asr(global_net, test_dl, backdoor_test_dl, train_poison_dl)
             global_net.to('cpu')
 

@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-from sklearn.mixture import GaussianMixture
+from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 import numpy as np
 
@@ -59,29 +59,30 @@ def _client_pseudo_gradient(global_net, w_local):
     return torch.cat(vec)
 
 
-def _split_suspicious(feats, min_samples):
+def _split_suspicious(feats, min_samples, sep_ratio):
 
     n = feats.shape[0]
     if n < min_samples:
         return np.zeros(n, dtype=bool)
 
-    # reduce dimension so the likelihood / BIC is stable with few samples
+    # reduce dimension so the cluster geometry is stable with few samples
     d = int(min(feats.shape[1], n - 1, 3))
     X = PCA(n_components=d, random_state=0).fit_transform(feats) if feats.shape[1] > d else feats
 
-    # reg_covar guards against collapsed / near-duplicate reconstructions that would
-    # otherwise give a singular covariance; if the fit still fails, treat as homogeneous.
-    try:
-        g1 = GaussianMixture(n_components=1, covariance_type='diag',
-                             reg_covar=1e-3, random_state=0).fit(X)
-        g2 = GaussianMixture(n_components=2, covariance_type='diag',
-                             reg_covar=1e-3, random_state=0).fit(X)
-    except ValueError:
+    km = KMeans(n_clusters=2, n_init=10, random_state=0).fit(X)
+    lab = km.labels_
+    if len(np.unique(lab)) < 2:
         return np.zeros(n, dtype=bool)
-    if g2.bic(X) >= g1.bic(X):
-        return np.zeros(n, dtype=bool)             # 1 component preferred -> homogeneous
 
-    lab = g2.predict(X)
+    # KMeans always returns 2 clusters, so accept the split only when the two are
+    # well separated: (inter-centroid distance) / (mean intra-cluster radius) > sep_ratio.
+    c0, c1 = km.cluster_centers_
+    between = float(np.linalg.norm(c0 - c1))
+    r0 = float(np.linalg.norm(X[lab == 0] - c0, axis=1).mean())
+    r1 = float(np.linalg.norm(X[lab == 1] - c1, axis=1).mean())
+    if between <= sep_ratio * (0.5 * (r0 + r1) + 1e-8):
+        return np.zeros(n, dtype=bool)             # not separated enough -> homogeneous
+
     minority = int(np.argmin(np.bincount(lab, minlength=2)))
     return lab == minority
 
@@ -109,7 +110,7 @@ def _graid_filter(args, global_net, recon, client_ids, logger):
     # ---- step 4: within-class clustering to detect suspicious reconstructions
     for c in np.unique(labels):
         idx = np.where(labels == c)[0]
-        flag = _split_suspicious(flat[idx], args.def_min_cluster)
+        flag = _split_suspicious(flat[idx], args.def_min_cluster, args.def_sep_ratio)
         suspicious[idx[flag]] = True
 
     # ---- step 5: label-consistency filtering on the (currently) benign group.

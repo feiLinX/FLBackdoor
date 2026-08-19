@@ -7,6 +7,8 @@ import torch.optim as optim
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import compute_accuracy
 from attacks.pgd import pgd_project_
+from attacks.chameleon import supcon_loss
+from attacks.soda import soda_self_reference
 
 
 def fedavg_global(global_net, client2loaders, nets_this_round):
@@ -25,7 +27,7 @@ def fedavg_global(global_net, client2loaders, nets_this_round):
     global_net.load_state_dict(w_global)
 
 
-def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_ls_rounds, comm_round, test_dl, adv_clients=None, neuro_mask=None):
+def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_ls_rounds, comm_round, test_dl, adv_clients=None, neuro_mask=None, clean_loaders=None):
     # local training on all selected clients
     client_ls_current = client_ls_rounds[comm_round]
     nets_current = {k: client2nets[k] for k in client_ls_current}
@@ -55,8 +57,13 @@ def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_l
         cdls_stealth = is_mal and model_poison and attack == 'CDLS' and args.bd_stealth_lambda > 0
         pgd = is_mal and attack == 'PGD'
         neuro = is_mal and attack == 'Neurotoxin' and neuro_mask is not None
+        chameleon = is_mal and attack == 'Chameleon'
+        soda = is_mal and attack == 'SoDa' and clean_loaders is not None and client_idx in clean_loaders
         ref_params = [p.detach().clone() for p in net.parameters()] if cdls_stealth else None
         mask_cuda = [m.cuda() for m in neuro_mask] if neuro else None
+        # SoDa: benign self-reference (train a copy on this client's clean data) that the
+        # poisoned update is regularised toward (L2 + cosine) so it looks honest
+        soda_ref_vec = soda_self_reference(global_net, clean_loaders[client_idx], args) if soda else None
 
         train_loader = client2loaders[client_idx]
         test_loader = test_dl
@@ -85,6 +92,18 @@ def fedavg_local(args, global_net, logger, client2nets, client2loaders, client_l
                 if cdls_stealth:
                     reg = sum(((p - r) ** 2).sum() for p, r in zip(net.parameters(), ref_params))
                     loss = loss + args.bd_stealth_lambda * reg
+
+                # Chameleon: supervised-contrastive peer-adaptation on the features
+                if chameleon:
+                    loss = loss + args.chameleon_lambda * supcon_loss(features, target, args.chameleon_temp)
+
+                # SoDa: keep the malicious update close (L2 + cosine) to the clean self-reference
+                if soda:
+                    cur_vec = torch.nn.utils.parameters_to_vector(net.parameters())
+                    l2 = torch.norm(cur_vec - soda_ref_vec)
+                    cos = torch.nn.functional.cosine_similarity(cur_vec, soda_ref_vec, dim=0)
+                    loss = loss + args.soda_l2 * l2 + args.soda_cos * (1 - cos)
+
                 loss.backward()
 
                 # Neurotoxin: zero the gradient on the coords benign clients update most
