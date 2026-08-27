@@ -23,14 +23,11 @@ def krum(global_net, client2loaders, nets_this_round, nbyz=0, m=1):
         scores[i] = neighbours.sum()
 
     # how many clients survive: m=1 is Krum, m>1 is Multi-Krum, m=None keeps n-nbyz.
-    # Clamp to n-nbyz so Multi-Krum always drops at least the nbyz most-outlying
-    # updates; otherwise m>=n silently degenerates into plain FedAvg (no defense).
     max_keep = max(n - nbyz, 1)
     n_keep = max_keep if m is None else min(max(int(m), 1), max_keep)
     selected_idx = torch.argsort(scores)[:n_keep].tolist()
     selected_ids = [client_ids[i] for i in selected_idx]
 
-    # ---- from here it's exactly fedavg_global, but only over the survivors ----
     total_data_points = sum([len(client2loaders[r].dataset) for r in selected_ids])
     fed_avg_freqs = [len(client2loaders[r].dataset) / total_data_points for r in selected_ids]
 

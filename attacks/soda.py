@@ -13,11 +13,7 @@ from attacks.cdls import InMemoryImageDataset, get_cdls_transforms, _load_cdls_r
 
 
 def soda_self_reference(global_net, clean_loader, args):
-    """SoDa self-reference stage (soda src/agent.py): train a fresh copy of the current
-    global model on a malicious client's CLEAN (un-poisoned) data for args.epochs, and
-    return its flattened trainable parameters. During the subsequent poisoned training
-    the malicious update is regularised to stay close to this benign reference (L2 +
-    cosine), so it looks like an honest update to norm / direction robust aggregators."""
+    """SoDa self-reference stage: train a copy of the global model on a malicious client's clean data."""
     ref = copy.deepcopy(global_net).cuda()
     ref.train()
     opt = optim.SGD(ref.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.wd)
@@ -34,12 +30,7 @@ def soda_self_reference(global_net, clean_loader, args):
 def build_soda_backdoor(args, client2dataidx, adv_clients, target_label, poison_frac,
                         dataset='digits', domain=None, ood_dataset='cifar10', ood_domain=None,
                         ood_test_size=2000, seed=0):
-    """SoDa OOD backdoor (soda src): malicious clients replace a poison_frac of their
-    samples with out-of-distribution images (from `ood_dataset`) relabelled to
-    target_label, so the model learns OOD -> target; ASR is measured on held-out OOD
-    test images. Returns the usual 4-tuple PLUS client2clean_loaders (the malicious
-    clients' un-poisoned loaders), which feeds the self-reference stage in fedavg_local.
-    Reuses the CDLS in-memory pipeline (transforms / raw-image loading)."""
+
     if dataset == 'digits' and domain is None:
         domain = args.bd_domain
 
@@ -57,12 +48,12 @@ def build_soda_backdoor(args, client2dataidx, adv_clients, target_label, poison_
         if client_id in adv_clients:
             images, labels = _load_cdls_raw_images(args, dataset, domain, dataidxs, train=True)
 
-            # clean loader for the self-reference stage (built BEFORE poisoning)
+            # clean loader for the self-reference (built BEFORE poisoning)
             clean_ds = InMemoryImageDataset([im.copy() for im in images], list(labels), transform=transform_train)
             client2clean_loaders[client_id] = DataLoader(clean_ds, batch_size=args.batch_size,
                                                          drop_last=True, shuffle=True, num_workers=4)
 
-            # poison: replace a fraction of samples with random OOD images -> target label
+
             n_poison = int(round(poison_frac * len(images)))
             victim_idx = rng.sample(range(len(images)), n_poison) if n_poison > 0 else []
             for i in victim_idx:
@@ -83,7 +74,7 @@ def build_soda_backdoor(args, client2dataidx, adv_clients, target_label, poison_
         InMemoryImageDataset(train_poison_images, train_poison_labels, transform=transform_test),
         batch_size=args.batch_size, shuffle=False, num_workers=4) if train_poison_images else None
 
-    # ---- test: clean victim test (ACC) + OOD test images relabelled target (ASR) ----
+
     test_images, test_labels = _load_cdls_raw_images(args, dataset, domain, None, train=False)
     clean_test_dl = DataLoader(
         InMemoryImageDataset([im.copy() for im in test_images], list(test_labels), transform=transform_test),

@@ -40,7 +40,7 @@ def build_trigger_backdoor(args, client2dataidx, adv_clients, target_label, pois
 
     transform_train, transform_test = get_cdls_transforms(args, dataset)
 
-    # ---- train side: poison the malicious clients' own data ----
+    # train side
     client2loaders = {}
     train_poison_images, train_poison_labels = [], []
     for client_id in range(args.nclients):
@@ -71,7 +71,7 @@ def build_trigger_backdoor(args, client2dataidx, adv_clients, target_label, pois
     else:
         train_poison_dl = None
 
-    # ---- test side: clean test set + every non-target test image triggered ----
+    # test side
     test_images, test_labels = _load_cdls_raw_images(args, dataset, domain, None, train=False)
 
     clean_test_dl = DataLoader(
@@ -81,7 +81,7 @@ def build_trigger_backdoor(args, client2dataidx, adv_clients, target_label, pois
     bd_src = [i for i in range(len(test_labels)) if int(test_labels[i]) != int(target_label)]
     if bd_src:
         bd_images = [add_trigger(test_images[i], trigger_size, trigger_value) for i in bd_src]
-        bd_labels = [int(target_label)] * len(bd_src)   # ASR = fraction predicted as target
+        bd_labels = [int(target_label)] * len(bd_src)   
         backdoor_test_dl = DataLoader(
             InMemoryImageDataset(bd_images, bd_labels, transform=transform_test),
             batch_size=args.batch_size, shuffle=False, num_workers=4)

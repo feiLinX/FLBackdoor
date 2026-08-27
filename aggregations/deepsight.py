@@ -15,7 +15,6 @@ def deepsight(global_net, client2loaders, nets_this_round,
     global_net = global_net.to(device).eval()
     g_state = global_net.state_dict()
 
-    # locate the output (last nn.Linear) layer -> its weight/bias keys + #classes
     last_name = None
     for name, module in global_net.named_modules():
         if isinstance(module, nn.Linear):
@@ -27,7 +26,7 @@ def deepsight(global_net, client2loaders, nets_this_round,
     sample_x = next(iter(client2loaders[client_ids[0]]))[0]
     C, H, W = sample_x.shape[1], sample_x.shape[2], sample_x.shape[3]
 
-    # ---- NEUPs (per-class output-update energy) and TEs (threshold exceedings) ----
+
     gw = g_state[w_key].detach().cpu().numpy()
     gb = g_state[b_key].detach().cpu().numpy()
     NEUPs, TEs = [], []
@@ -43,7 +42,7 @@ def deepsight(global_net, client2loaders, nets_this_round,
     # a LOW threshold-exceeding count marks a client as suspicious (label 1)
     labels = np.array([0 if te >= np.median(TEs) / 2 else 1 for te in TEs])
 
-    # ---- DDifs: mean softmax ratio (local / global) over random-noise inputs ----
+
     temp_model = copy.deepcopy(global_net)
     DDifs = np.zeros((num_seeds, n, num_classes))
     for s in range(num_seeds):
@@ -64,7 +63,6 @@ def deepsight(global_net, client2loaders, nets_this_round,
             DDifs[s, ci] = (DDif / num_samples).cpu().numpy()
     del temp_model
 
-    # ---- cosine distance between the clients' output-layer bias updates ----
     cos = nn.CosineSimilarity(dim=0, eps=1e-6)
     gb_t = g_state[b_key].detach().cpu()
     bias_updates = [nets_this_round[c].state_dict()[b_key].detach().cpu() - gb_t for c in client_ids]
@@ -73,7 +71,6 @@ def deepsight(global_net, client2loaders, nets_this_round,
         for j in range(n):
             cosine_distance[i, j] = 1.0 - cos(bias_updates[i], bias_updates[j]).item()
 
-    # ---- cluster each fingerprint, fuse the memberships, run a final clustering ----
     def _dists_from_clust(clusters):
         pd = np.zeros((n, n))
         for i in range(n):
@@ -91,7 +88,6 @@ def deepsight(global_net, client2loaders, nets_this_round,
     merged = np.mean([ddif_dists, neup_dists, cosine_dists], axis=0)
     final_clusters = _cluster(merged)
 
-    # ---- accept clients: keep low-suspicion clusters (+ non-suspicious noise pts) ----
     accepted_pos = []
     for cl in np.unique(final_clusters):
         idxs = np.argwhere(final_clusters == cl).flatten()

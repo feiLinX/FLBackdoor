@@ -9,7 +9,6 @@ def flame(global_net, client2loaders, nets_this_round, lamda=0.001, add_noise=Tr
     nets = list(nets_this_round.values())
     n = len(nets)
 
-    # flatten trainable params -> geometry for clustering / clipping
     g_vec = torch.cat([p.detach().reshape(-1) for p in global_net.parameters()])
     vecs = [torch.cat([p.detach().reshape(-1) for p in net.parameters()]) for net in nets]
     update_norms = [torch.norm(v - g_vec) for v in vecs]

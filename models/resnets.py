@@ -25,13 +25,7 @@ class ResNet18(nn.Module):
         
 
 class ResNet18Small(nn.Module):
-    """For 32x32 inputs — CIFAR-style stem (3x3 conv stride 1, no maxpool).
-
-    The ImageNet stem downsamples a 32x32 image to 8x8 before layer1 even
-    runs, and all the way to 1x1 by layer4, wasting most of layer3/layer4's
-    capacity on a 1-2 pixel feature map. Replacing conv1/maxpool keeps the
-    spatial resolution reasonable through all four residual stages.
-    """
+    """For 32x32 inputs — CIFAR-style stem (3x3 conv stride 1, no maxpool)."""
     def __init__(self):
         super(ResNet18Small, self).__init__()
         base = torchvision.models.resnet18()  # fresh instance, independent weights

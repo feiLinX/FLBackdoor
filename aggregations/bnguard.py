@@ -10,7 +10,6 @@ def bnguard(global_net, client2loaders, nets_this_round):
     client_ids = list(nets_this_round.keys())
     n = len(client_ids)
 
-    # feature per client = [mean(var), var(var), mean(mean), var(mean)] of its 1st BN layer
     features = []
     for c in client_ids:
         first_bn = None

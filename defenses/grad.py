@@ -11,18 +11,18 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aggregations import fedavg_global
 
 
-def _graid_input_shape(args):
+def _grad_input_shape(args):
 
     if args.dataset in ('digits', 'cifar10', 'cifar100'):
         return 3, 32, 32
     return 3, 224, 224  # domain / office (expensive to invert -- see notes)
 
 
-def _graid_num_classes(args):
+def _grad_num_classes(args):
     return 100 if args.dataset == 'cifar100' else 10
 
 
-def _graid_input_bounds(args, device):
+def _grad_input_bounds(args, device):
 
     if args.dataset == 'cifar10':
         mean = [125.3 / 255, 123.0 / 255, 113.9 / 255]
@@ -74,8 +74,6 @@ def _split_suspicious(feats, min_samples, sep_ratio):
     if len(np.unique(lab)) < 2:
         return np.zeros(n, dtype=bool)
 
-    # KMeans always returns 2 clusters, so accept the split only when the two are
-    # well separated: (inter-centroid distance) / (mean intra-cluster radius) > sep_ratio.
     c0, c1 = km.cluster_centers_
     between = float(np.linalg.norm(c0 - c1))
     r0 = float(np.linalg.norm(X[lab == 0] - c0, axis=1).mean())
@@ -87,7 +85,7 @@ def _split_suspicious(feats, min_samples, sep_ratio):
     return lab == minority
 
 
-def _graid_filter(args, global_net, recon, client_ids, logger):
+def _grad_filter(args, global_net, recon, client_ids, logger):
 
     device = next(global_net.parameters()).device
 
@@ -107,13 +105,11 @@ def _graid_filter(args, global_net, recon, client_ids, logger):
     owners = np.asarray(owners)
     suspicious = np.zeros(n, dtype=bool)
 
-    # ---- step 4: within-class clustering to detect suspicious reconstructions
     for c in np.unique(labels):
         idx = np.where(labels == c)[0]
         flag = _split_suspicious(flat[idx], args.def_min_cluster, args.def_sep_ratio)
         suspicious[idx[flag]] = True
 
-    # ---- step 5: label-consistency filtering on the (currently) benign group.
     benign = np.where(~suspicious)[0]
     if len(benign) > 0:
         global_net.eval()
@@ -121,20 +117,19 @@ def _graid_filter(args, global_net, recon, client_ids, logger):
             preds = global_net(imgs_t[benign].to(device)).argmax(dim=1).cpu().numpy()
         suspicious[benign[preds != labels[benign]]] = True
 
-    # ---- step 6: discard clients whose suspicious fraction exceeds the threshold
     accepted = []
     for cid in client_ids:
         m = owners == cid
         frac = float(suspicious[m].mean()) if m.any() else 0.0
         if frac > args.def_susp_threshold:
             if logger is not None:
-                logger.info('[GRAID] discard client %s (suspicious frac %.2f)' % (str(cid), frac))
+                logger.info('[GRAD] discard client %s (suspicious frac %.2f)' % (str(cid), frac))
         else:
             accepted.append(cid)
 
     if not accepted:
         if logger is not None:
-            logger.info('[GRAID] all clients flagged this round -> keeping all (FedAvg fallback)')
+            logger.info('[GRAD] all clients flagged this round -> keeping all (FedAvg fallback)')
         accepted = list(client_ids)
 
     return accepted
@@ -155,7 +150,6 @@ def reconstruct_client_batch(global_net, params, target_vec, dummy_x, dummy_y,
         logp = F.log_softmax(out, dim=1)
         task_loss = -(soft * logp).sum(dim=1).mean()          # soft-label CE
 
-        # dummy gradient wrt model params (create_graph -> differentiable wrt x, y)
         grads = torch.autograd.grad(task_loss, params, create_graph=True, allow_unused=True)
         grads = [g if g is not None else torch.zeros_like(p) for g, p in zip(grads, params)]
         gvec = torch.cat([g.reshape(-1) for g in grads])
@@ -163,7 +157,6 @@ def reconstruct_client_batch(global_net, params, target_vec, dummy_x, dummy_y,
         rec_loss = 1.0 - F.cosine_similarity(gvec, target_vec, dim=0)
         loss = rec_loss + tv_weight * _total_variation(dummy_x)
 
-        # grads wrt the dummy tensors only (do NOT pollute model .grad buffers)
         gx, gy = torch.autograd.grad(loss, [dummy_x, dummy_y])
         dummy_x.grad, dummy_y.grad = gx, gy
         opt.step()
@@ -177,41 +170,38 @@ def reconstruct_client_batch(global_net, params, target_vec, dummy_x, dummy_y,
     return dummy_x.detach(), dummy_y.detach()
 
 
-def graid_aggregate(args, global_net, nets_current, client2loaders, comm_round, logger):
+def grad_aggregate(args, global_net, nets_current, client2loaders, comm_round, logger):
 
     device = 'cuda'
     global_net = global_net.to(device)
     global_net.eval()
     params = [p for _, p in global_net.named_parameters() if p.requires_grad]
 
-    C, H, W = _graid_input_shape(args)
-    n_classes = _graid_num_classes(args)
+    C, H, W = _grad_input_shape(args)
+    n_classes = _grad_num_classes(args)
     client_ids = list(nets_current.keys())
 
     # warm-up
     warmup = getattr(args, 'def_warmup', 0)
     if comm_round < warmup:
         if logger is not None:
-            logger.info('[GRAID] round %d < warm-up %d: no screening -> FedAvg over all'
+            logger.info('[GRAD] round %d < warm-up %d: no screening -> FedAvg over all'
                         % (comm_round, warmup))
         global_net.to('cpu')
         fedavg_global(global_net, client2loaders, nets_current)
         return list(client_ids)
 
-    # run the (expensive) reconstruction + screening only every def_recon_every
-    # rounds; on the other rounds fall back to plain FedAvg over all clients.
     recon_every = max(1, getattr(args, 'def_recon_every', 1))
     if comm_round % recon_every != 0:
         if logger is not None:
-            logger.info('[GRAID] round %d: skipping reconstruction (runs every %d rounds) -> FedAvg over all'
+            logger.info('[GRAD] round %d: skipping reconstruction (runs every %d rounds) -> FedAvg over all'
                         % (comm_round, recon_every))
         global_net.to('cpu')
         fedavg_global(global_net, client2loaders, nets_current)
         return list(client_ids)
 
-    box = _graid_input_bounds(args, device)   # project dummy images onto the valid pixel range
+    box = _grad_input_bounds(args, device)   # project dummy images onto the valid pixel range
 
-    # ---- steps 1-3: per-client gradient-inversion reconstruction (fresh each round) ----
     recon = {}
     for cid in client_ids:
         w_local = nets_current[cid].state_dict()
@@ -224,13 +214,11 @@ def graid_aggregate(args, global_net, nets_current, client2loaders, comm_round, 
             iters=args.def_recon_iters, lr=args.def_recon_lr, tv_weight=args.def_tv_weight, box=box)
         recon[cid] = (dummy_x.detach(), dummy_y.detach())
 
-    # ---- steps 4-6: screen and discard (runs every round; no warm-up) ----
-    accepted = _graid_filter(args, global_net, recon, client_ids, logger)
+    accepted = _grad_filter(args, global_net, recon, client_ids, logger)
     if logger is not None:
-        logger.info('[GRAID] round %d accepted %d/%d clients: %s'
+        logger.info('[GRAD] round %d accepted %d/%d clients: %s'
                     % (comm_round, len(accepted), len(client_ids), str(accepted)))
 
-    # ---- aggregate over accepted clients (FedAvg) ----
     global_net.to('cpu')  # match fedavg_global, which mixes cpu client state_dicts
     accepted_nets = {cid: nets_current[cid] for cid in accepted}
     fedavg_global(global_net, client2loaders, accepted_nets)

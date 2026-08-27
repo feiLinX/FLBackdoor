@@ -1,3 +1,4 @@
+# The Cross Domain Backdoor Attack implementation
 import random
 import os
 import sys
@@ -118,7 +119,7 @@ def _load_cdls_raw_images(args, dataset, domain, dataidxs, train=True):
     return images, labels
 
 
-# ---------------------------- Embedding-KLD and Prediction-KLD ----------------------------
+# ---------------------------- Encoder and Linear Probe ----------------------------
 class ProjectionHead(nn.Module):
     def __init__(self, in_dim=512, hidden_dim=512, out_dim=128):
         super().__init__()
@@ -166,11 +167,7 @@ class SimCLRResNet(nn.Module):
 
 
 class InMemoryImageDataset(Dataset):
-    """Wrap a list of (uint8 HWC numpy image, int label) pairs so poisoned
-    data -- which mixes raw pixels sourced from multiple digit-domain
-    donors -- can go through the same transform pipeline as the path-based
-    DigitsDataset (ToPILImage -> ... -> ToTensor -> Normalize).
-    """
+    """Make poisoned data go through the same transform pipeline as the original dataset."""
     def __init__(self, images, labels, transform=None):
         self.images = images
         self.labels = labels
@@ -335,8 +332,7 @@ def train_adv_classifier(encoder, args, domains, epochs=10, lr=1e-2, logger=None
 
 
 def train_adv_classifier_domain(encoder, args, domains, img_size=96, epochs=10, lr=1e-2, logger=None):
-    """Linear probe (adversary classifier) on the frozen DomainNet SimCLR encoder;
-    used by pred_kl to obtain class-probability distributions for donor selection."""
+    """Linear probeon the frozen DomainNet SimCLR encoder; used by pred_kl to obtain class-probability distributions."""
     tf = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((img_size, img_size)),
@@ -436,7 +432,6 @@ def poison_label_swap(images, labels, target_label, partition, donor_pool,
     n_replace = int(round(len(victim_idx) * partition))
     victim_idx = rng.sample(victim_idx, n_replace) if n_replace > 0 else []
 
-    # precompute victim representations once (embed_kl / pred_kl only)
     victim_reprs = None
     if distance_mode in ('embed_kl', 'pred_kl') and victim_idx:
         victim_imgs = [images[i] for i in victim_idx]
@@ -457,7 +452,9 @@ def poison_label_swap(images, labels, target_label, partition, donor_pool,
             cand = rng.sample(range(pool_size), max_search)
 
         best_dist, best_j = float('inf'), None
-        if distance_mode == 'raw_kl':
+        if distance_mode == 'random':
+            best_dist, best_j = 0.0, rng.randrange(pool_size)
+        elif distance_mode == 'raw_kl':
             for j in cand:
                 donor_resized = _pil_resize_like(donor_pool[j][0], target_hw)
                 dist = _kld_raw(victim_img, donor_resized)
@@ -475,8 +472,25 @@ def poison_label_swap(images, labels, target_label, partition, donor_pool,
         if threshold is not None and best_dist >= threshold:
             continue
 
-        # replace pixels with the (resized) donor image; labels[idx] stays target_label
         images[idx] = _pil_resize_like(donor_pool[best_j][0], target_hw)
+        replaced.append(idx)
+
+    return replaced
+
+
+def poison_random_swap(images, labels, partition, donor_pool, seed=0):
+
+    rng = random.Random(seed)
+    n = len(images)
+    n_replace = int(round(n * partition))
+    victim_idx = rng.sample(range(n), n_replace) if n_replace > 0 else []
+
+    pool_size = len(donor_pool)
+    replaced = []
+    for idx in victim_idx:
+        target_hw = images[idx].shape[:2]
+        j = rng.randrange(pool_size)
+        images[idx] = _pil_resize_like(donor_pool[j][0], target_hw)
         replaced.append(idx)
 
     return replaced
@@ -563,17 +577,20 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
         if client_id in adv_clients:
             images, labels = _load_cdls_raw_images(args, dataset, domain, dataidxs, train=True)
 
-            replaced_idx = poison_label_swap(images, labels, target_label, partition, train_donor_pool,
-                                             max_search=max_search, threshold=threshold, seed=seed + client_id,
-                                             distance_mode=distance_mode, extractor=extractor,
-                                             donor_reprs=train_donor_reprs)
+            if distance_mode == 'random':
+                replaced_idx = poison_random_swap(images, labels, partition, train_donor_pool,
+                                                  seed=seed + client_id)
+            else:
+                replaced_idx = poison_label_swap(images, labels, target_label, partition, train_donor_pool,
+                                                 max_search=max_search, threshold=threshold, seed=seed + client_id,
+                                                 distance_mode=distance_mode, extractor=extractor,
+                                                 donor_reprs=train_donor_reprs)
+                
             # keep the literal poisoned (image, label) pairs for the train_asr diagnostic
             train_poison_images.extend(images[i] for i in replaced_idx)
             train_poison_labels.extend(labels[i] for i in replaced_idx)
 
-            # DomainNet/Office benign clients get aug_mult-tiled loaders (see
-            # get_dataloader); tile the malicious client too so its per-round
-            # dataset size (and thus FedAvg weight) matches the benign clients.
+            # DomainNet/Office benign clients get aug_mult-tiled loaders
             if dataset in ('domain', 'office') and args.aug_mult > 1:
                 train_images, train_labels = images * args.aug_mult, labels * args.aug_mult
             else:
@@ -593,7 +610,6 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
     else:
         train_poison_dl = None
 
-    # ---- test side: build one mixed test set, split into clean vs replaced ----
     test_donor_pool = build_donor_pool(args.data_dir, donor_domains, target_label,
                                        train=False, pool_size_per_domain=donor_pool_size, seed=seed,
                                        donor_dataset=donor_dataset, exclude_target_label=exclude_target)
@@ -613,7 +629,6 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
     clean_imgs, clean_lbls = [test_images[i] for i in clean_idx], [test_labels[i] for i in clean_idx]
     bd_imgs, bd_lbls = [test_images[i] for i in replaced_idx], [test_labels[i] for i in replaced_idx]
 
-    # DomainNet/Office: tile the raw test set ×aug_mult, mirroring the train-side aug_mult
     if dataset in ('domain', 'office') and args.aug_mult > 1:
         clean_imgs, clean_lbls = clean_imgs * args.aug_mult, clean_lbls * args.aug_mult
         bd_imgs, bd_lbls = bd_imgs * args.aug_mult, bd_lbls * args.aug_mult

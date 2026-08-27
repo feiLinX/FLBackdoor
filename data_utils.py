@@ -300,11 +300,7 @@ def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None):
         if dataidxs is not None and args.aug_mult > 1:
             # Replicate the client's indices so the same underlying images are
             # sampled (and independently transformed via the random augmentations
-            # above) multiple times per epoch. This is what actually increases
-            # the number of samples/batches a client trains on per round --
-            # the augmentation transforms alone only diversify existing samples
-            # in place without changing len(dataset). Only applied for 'domain'
-            # and 'office', whose clients have far fewer raw images per class.
+            # above) multiple times per epoch.
             dataidxs = np.tile(np.asarray(dataidxs), args.aug_mult)
 
         train_ds = dl_obj(data_dir, subset, dataidxs=dataidxs, train=True, transform=transform_train)
