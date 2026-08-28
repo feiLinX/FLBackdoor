@@ -1,5 +1,5 @@
 # Introduction
-These are the source codes of the implementation our cross-domain FL backdoor attack leveraging feature non-IIDness and the proposed Gradient-inversion Reconstruction-based Anomaly Detection (GRAD) defense.
+These are the source codes of the implementation our cross-domain FL backdoor attack leveraging feature non-IIDness and the proposed GRAD defense.
 
 # Environment
 Experiments were run with the following software versions:
@@ -19,8 +19,8 @@ Experiments were run with the following software versions:
 Built against CUDA 12.8 and cuDNN 9.7.1.
 
 # Data
-Digits-5: https://drive.google.com/file/d/1RemE1_6K-laAN-yHtSb8uDhrgBdXosIg/view?usp=sharing
-DomainNet: https://drive.google.com/file/d/1ybeC4FlmL3CA3brEhiW9CkOPaakJNkzQ/view?usp=sharing
+- Digits-5: https://drive.google.com/file/d/1RemE1_6K-laAN-yHtSb8uDhrgBdXosIg/view?usp=sharing
+- DomainNet: https://drive.google.com/file/d/1ybeC4FlmL3CA3brEhiW9CkOPaakJNkzQ/view?usp=sharing
 
 # How to run
 - `main.py`: `--data_dir`, `--logdir`, and `--ckptdir` contain no hardcoded absolute paths. Their defaults are computed relative to the location of `main.py` (via `os.path.dirname(__file__)`), resolving to `<repo>/../../data/`, `<repo>/logs/`, and `<repo>/saved_models/` respectively. Pass the corresponding flag on the command line if your data lives elsewhere.
