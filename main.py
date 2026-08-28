@@ -23,6 +23,17 @@ _CODES_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_DIR = os.path.dirname(_CODES_DIR)  # repository root holding codes/, logs/, saved_models/
 
 
+def _resolve_default_data_dir():
+    candidates = [
+        os.path.join(_CODES_DIR, 'data'),
+        os.path.normpath(os.path.join(_PROJECT_DIR, os.pardir, os.pardir, 'data')),
+    ]
+    for cand in candidates:
+        if os.path.isdir(cand):
+            return cand + os.sep
+    return candidates[-1] + os.sep
+
+
 def args_parser():
     parser = argparse.ArgumentParser()
 
@@ -86,7 +97,7 @@ def args_parser():
     parser.add_argument("--def_recon_iters", help="gradient-inversion optimization steps", default=100, type=int)
     parser.add_argument("--def_recon_lr", help="Adam learning rate for reconstructing dummy x and y", default=0.1, type=float)
     parser.add_argument("--def_tv_weight", help="total-variation image-prior weight", default=1e-2, type=float)
-    parser.add_argument("--def_recon_every", help="run every K rounds (1=every round)", default=3, type=int)
+    parser.add_argument("--def_recon_every", help="run every K rounds (1=every round)", default=1, type=int)
     parser.add_argument("--def_warmup", help="# initial warm-up rounds", default=0, type=int)
     parser.add_argument("--def_min_cluster", help="min reconstructed samples of a class needed to attempt a split", default=6, type=int)
     parser.add_argument("--def_sep_ratio", help="threshold of accepting the KMeans 2-way split", default=3.0, type=float)
@@ -115,7 +126,7 @@ def args_parser():
 
     # Logging
     parser.add_argument("--data_dir", type=str, required=False,
-                        default=os.path.normpath(os.path.join(_PROJECT_DIR, os.pardir, os.pardir, 'data')) + os.sep)
+                        default=_resolve_default_data_dir())
 
     parser.add_argument('--logdir', type=str, required=False,
                         default=os.path.join(_PROJECT_DIR, 'logs') + os.sep)

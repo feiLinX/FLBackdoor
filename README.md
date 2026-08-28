@@ -21,9 +21,10 @@ Built against CUDA 12.8 and cuDNN 9.7.1.
 # Data
 - Digits-5: https://drive.google.com/file/d/1RemE1_6K-laAN-yHtSb8uDhrgBdXosIg/view?usp=sharing
 - DomainNet: https://drive.google.com/file/d/1ybeC4FlmL3CA3brEhiW9CkOPaakJNkzQ/view?usp=sharing
+- Unzip each dataset to `<repo>/data` before running any script, i.e., alongside aggregations/, attacks/, etc.
 
 # How to run
-- `main.py`: `--data_dir`, `--logdir`, and `--ckptdir` contain no hardcoded absolute paths. Their defaults are computed relative to the location of `main.py` (via `os.path.dirname(__file__)`), resolving to `<repo>/../../data/`, `<repo>/logs/`, and `<repo>/saved_models/` respectively. Pass the corresponding flag on the command line if your data lives elsewhere.
+- `main.py`: `--data_dir`, `--logdir`, and `--ckptdir` contain no hardcoded absolute paths. Their defaults are computed relative to the location of `main.py` (via `os.path.dirname(__file__)`), resolving to `<repo>/logs/` and `<repo>/saved_models/` respectively. Pass the corresponding flag on the command line if your data lives elsewhere.
 - Run scripts under `scripts/`: the interpreter is selected via `PYTHON="${PYTHON:-python}"`, i.e. the `python` found on your `PATH` (e.g. an activated conda environment) is used by default. Set `export PYTHON=/path/to/python` to point at a specific interpreter.
 - An example: to test the Full attack against FLAME on Digits-5 with MobileNetV2 as the model, run `./digits_mobilenetv2_nclients_20_agg_flame_att_pred+model_full.sh` in `scripts/`.
 
