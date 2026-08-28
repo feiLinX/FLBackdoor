@@ -399,7 +399,7 @@ if __name__ == "__main__":
         if args.adv_type in ('CDLS', 'PGD', 'Neurotoxin', 'Vanilla', 'Chameleon', 'SoDa'):
             test_acc, test_asr, local_test_asr = evaluate_acc_asr(global_net, test_dl, backdoor_test_dl, local_poison_dl)
             global_net.to('cpu')
-            global_asr = max(test_asr, local_test_asr)
+            global_asr = test_asr if args.dataset == 'digits' else max(test_asr, local_test_asr)
             logger.info('>> Global Model Train Acc: %f' % train_acc)
             logger.info('>> Global Model Test ACC: %f' % test_acc)
             logger.info('>> Global Model ASR: %f' % global_asr)
