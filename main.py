@@ -168,9 +168,9 @@ if __name__ == "__main__":
     mkdirs(os.path.join(args.ckptdir, args.aggregation))
 
     if args.log_file_name is None:
-        argument_path = 'experiment_arguments-%s' % datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S")
+        argument_path = 'exp_args-%s' % datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S")
     else:
-        argument_path = 'experiment_arguments-%s' % args.log_file_name
+        argument_path = 'exp_args-%s' % args.log_file_name
 
     argument_path = argument_path + '.json'
 
@@ -178,7 +178,7 @@ if __name__ == "__main__":
         json.dump(str(args), f)
 
     if args.log_file_name is None:
-        args.log_file_name = 'experiment_log-%s' % (datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S"))
+        args.log_file_name = 'exp_log-%s' % (datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S"))
 
     log_path = args.log_file_name + '.log'
     print('log path: ', log_path)
