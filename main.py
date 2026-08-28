@@ -124,7 +124,7 @@ def args_parser():
     parser.add_argument('--ckptdir', type=str, required=False,
                         default=os.path.join(_PROJECT_DIR, 'saved_models') + os.sep)
     
-    parser.add_argument('--print_interval', type=int, default=2,
+    parser.add_argument('--print_interval', type=int, default=5,
                         help='how many comm round to print results on screen')
     parser.add_argument('--save_interval', type=int, default=10,
 
