@@ -10,10 +10,10 @@ SCRIPT="$(dirname "$0")/../main.py"
     --dataset domain \
     --model mobilenetv2 \
     --lr 1e-2 \
-    --wd 5e-4 \
+    --wd 4e-5 \
     --aggregation fedavg \
     --nclients 20 \
-    --nrounds 30 \
+    --nrounds 35 \
     --epochs 5 \
     --krum_m 15 \
     --batch_size 64 \

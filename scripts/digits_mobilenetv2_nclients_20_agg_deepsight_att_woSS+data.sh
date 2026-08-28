@@ -13,7 +13,7 @@ SCRIPT="$(dirname "$0")/../main.py"
     --wd 1e-5 \
     --aggregation deepsight \
     --nclients 20 \
-    --nrounds 30 \
+    --nrounds 35 \
     --epochs 5 \
     --krum_m 15 \
     --adv_type CDLS \

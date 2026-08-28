@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Digits-5 | model=MobileNetV2 | nclients=20 | nbyz=1 | fraction=0.1 | aggregation=bnguard
+# Digits-5 | model=MobileNetV2 | nclients=20 | nbyz=1 | bd_partition=0.1 | aggregation=bnguard
 # CDLS option: CDLS pred_kl + full model poisoning (stealth reg lambda=1e-3 + constrain-and-scale scale=2.0)
 set -euo pipefail
 
@@ -13,16 +13,15 @@ SCRIPT="$(dirname "$0")/../main.py"
     --wd 1e-5 \
     --aggregation bnguard \
     --nclients 20 \
-    --nrounds 30 \
+    --nrounds 35 \
     --epochs 5 \
-    --fraction 0.1 \
     --krum_m 15 \
     --adv_type CDLS \
     --nbyz 1 \
     --bd_target_label 0 \
-    --bd_partition 0.3 \
+    --bd_partition 0.1 \
     --bd_distance pred_kl \
     --bd_model_poison \
     --bd_stealth_lambda 1e-3 \
     --bd_scale 2.0 \
-    --log_file_name digits_mobilenetv2_nclients_20_nbyz_1_frac_0.1_agg_bnguard_att_pred+model
+    --log_file_name digits_mobilenetv2_nclients_20_nbyz_1_bdpart_0.1_agg_bnguard_att_pred+model

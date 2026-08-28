@@ -25,16 +25,17 @@ _PROJECT_DIR = os.path.dirname(_CODES_DIR)  # repository root holding codes/, lo
 
 def args_parser():
     parser = argparse.ArgumentParser()
+
     # Model
     parser.add_argument("--dataset", help="dataset", default='digits', type=str,
                         choices=['digits', 'office', 'domain', 'cifar10', 'cifar100'])
     parser.add_argument("--model", help="training model", default="resnet34", type=str,
                         choices=['cnn','resnet18', 'resnet34', 'resnet50', 'mobilenetv2'])
     parser.add_argument("--lr", help="learning rate", default=5e-4, type=float,
-                        choices=[1e-2, 1e-3, 5e-4])
+                        choices=[5e-4, 1e-2, 5e-2])
     parser.add_argument("--momentum", help="SGD momentum", default=0.9, type=float)
     parser.add_argument("--wd", help="weight decay", default=1e-5, type=float,
-                        choices=[5e-3, 5e-4, 1e-5])
+                        choices=[1e-5, 4e-5, 5e-4])
     parser.add_argument("--batch_size", help="batch size", default=64, type=int)
     parser.add_argument('--device', help="cpu, cuda", default="cuda", type=str)
     parser.add_argument("--gpu", help="index of gpu", default=0, type=int)
@@ -42,10 +43,10 @@ def args_parser():
     # FL
     parser.add_argument("--aggregation", help="aggregation rule/defense", default='fedavg', type=str,
                         choices=['fedavg', 'krum', 'flame', 'ndc', 'grad', 'deepsight', 'foolsgold', 'bnguard', 'indicator'])
-    parser.add_argument("--nrounds", help="# global rounds", default=30, type=int)
+    parser.add_argument("--nrounds", help="# global rounds", default=35, type=int)
     parser.add_argument("--epochs", help="# local epochs", default=5, type=int)
     parser.add_argument("--nclients", help="# clients", default=20, type=int)
-    parser.add_argument("--fraction", help="fraction of clients", default=0.3, type=float)
+    parser.add_argument("--fraction", help="fraction of clients", default=1, type=float)
     parser.add_argument("--bias", help="degree of label non-iidness", default=1, type=float)
     parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
     parser.add_argument('--partition', type=str, default='noniid', help='the data partitioning strategy, iid or noniid')
@@ -55,37 +56,19 @@ def args_parser():
 
     parser.add_argument('--krum_m', help="number of clients to select for Krum aggregation", default=15, type=int)
 
-    # Defense: GRAD
-    parser.add_argument("--def_num_recon", help="# dummy samples reconstructed per client", default=48, type=int)
-    parser.add_argument("--def_recon_iters", help="gradient-inversion optimization steps", default=100, type=int)
-    parser.add_argument("--def_recon_lr", help="Adam learning rate for reconstructing dummy x and y", default=0.1, type=float)
-    parser.add_argument("--def_tv_weight", help="total-variation image-prior weight", default=1e-2, type=float)
-    parser.add_argument("--def_recon_every", help="run every K rounds (1=every round)", default=3, type=int)
-    parser.add_argument("--def_warmup", help="# initial warm-up rounds", default=0, type=int)
-    parser.add_argument("--def_min_cluster", help="min reconstructed samples of a class needed to attempt a split", default=6, type=int)
-    parser.add_argument("--def_sep_ratio", help="threshold of accepting the KMeans 2-way split", default=3.0, type=float)
-    parser.add_argument("--def_susp_threshold", help="discard a client if this fraction of reconstructions is suspicious", default=0.3, type=float)
-
-    parser.add_argument("--ind_ood", help="OOD dataset the server's watermark probes", default=None, type=str, choices=['cifar10', 'digits'])
-    parser.add_argument("--ind_samples", help="# fixed OOD probe images", default=200, type=int)
-    parser.add_argument("--ind_inject_epochs", help="# epochs the server fine-tunes the global model", default=10, type=int)
-    parser.add_argument("--ind_inject_lr", help="SGD learning rate", default=0.01, type=float)
-    parser.add_argument("--ind_mu", help="weight of the proximal term during watermark injection", default=0.0, type=float)
-    parser.add_argument("--ind_threshold", help="discard a client whose watermark accuracy stays >= ", default=0.5, type=float)
-
     # Adversarial
     parser.add_argument("--adv_type", help="adv type", default='None', type=str,
                         choices=['None', 'CDLS', 'PGD', 'Neurotoxin', 'Vanilla', 'Chameleon', 'SoDa'])
-    parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=4, type=int)
-    parser.add_argument("--bd_target_label", help="original label targeted by the CDLS backdoor", default=0, type=int)
-    parser.add_argument("--bd_partition", help="fraction of a client's target_label samples to replace with the nearest cross-domain donor sample", default=0.5, type=float)
+    parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=2, type=int)
+    parser.add_argument("--bd_target_label", help="label targeted by the CDLS backdoor", default=0, type=int)
+    parser.add_argument("--bd_partition", help="fraction of a client's target_label samples to replace with the cross-domain sample", default=0.3, type=float)
     parser.add_argument("--bd_domain", help="digits sub-dataset the clients are assigned to", default='mnist', type=str,
                         choices=['mnist', 'mnist_m', 'svhn', 'syn', 'usps'])
     parser.add_argument("--bd_donor_domains", help="digits sub-datasets donor replacement samples are drawn from; defaults to all domains other than --bd_domain", default=None, type=str, nargs='+')
     parser.add_argument("--bd_donor_pool_size", help="max donor samples per domain", default=1000, type=int)
     parser.add_argument("--bd_max_search", help="max donor pool entries scanned per victim sample", default=500, type=int)
 
-    # CDLS donor-selection distance space (raw pixels vs learned SimCLR features)
+    # CDLS
     parser.add_argument("--bd_distance", help="feature extractor for CDLS, embed_kl stands for Encoder, pred_kl stands for Encoder + LP", default='pred_kl', type=str,
                         choices=['raw_kl', 'embed_kl', 'pred_kl', 'random'])
     parser.add_argument("--bd_simclr_epochs", help="adversary SimCLR pretraining epochs", default=50, type=int)
@@ -94,18 +77,36 @@ def args_parser():
     parser.add_argument("--bd_simclr_temp", help="temperature", default=0.5, type=float)
     parser.add_argument("--bd_simclr_img_size", help="adversary SimCLR input resolution for DomainNet", default=96, type=int)
 
-    # CDLS model-poisoning
-    parser.add_argument("--bd_model_poison", help="enable model-poisoning on top of CDLS data poisoning (stealth reg + constrain-and-scale)", action='store_true')
+    parser.add_argument("--bd_model_poison", help="enable model-poisoning (stealth reg + constrain-and-scale)", action='store_true')
     parser.add_argument("--bd_stealth_lambda", help="weight of the regularizer on malicious clients", default=1e-3, type=float)
     parser.add_argument("--bd_scale", help="scaling factor for constrain-and-scale", default=2.0, type=float)
 
-    # PGD (Attack of the Tails, Wang et al. 2020) & Neurotoxin (Zhang et al. 2022):
+    # GRAD
+    parser.add_argument("--def_num_recon", help="# dummy samples reconstructed per client", default=48, type=int)
+    parser.add_argument("--def_recon_iters", help="gradient-inversion optimization steps", default=100, type=int)
+    parser.add_argument("--def_recon_lr", help="Adam learning rate for reconstructing dummy x and y", default=0.1, type=float)
+    parser.add_argument("--def_tv_weight", help="total-variation image-prior weight", default=1e-2, type=float)
+    parser.add_argument("--def_recon_every", help="run every K rounds (1=every round)", default=3, type=int)
+    parser.add_argument("--def_warmup", help="# initial warm-up rounds", default=0, type=int)
+    parser.add_argument("--def_min_cluster", help="min reconstructed samples of a class needed to attempt a split", default=6, type=int)
+    parser.add_argument("--def_sep_ratio", help="threshold of accepting the KMeans 2-way split", default=3.0, type=float)
+    parser.add_argument("--def_susp_threshold", help="discard a client if this fraction of reconstructions is suspicious", default=0.51, type=float)
+
+    # Indicator
+    parser.add_argument("--ind_ood", help="OOD dataset the server's watermark probes", default=None, type=str, choices=['cifar10', 'digits'])
+    parser.add_argument("--ind_samples", help="# fixed OOD probe images", default=100, type=int)
+    parser.add_argument("--ind_inject_epochs", help="# epochs the server fine-tunes the global model", default=10, type=int)
+    parser.add_argument("--ind_inject_lr", help="SGD learning rate", default=0.01, type=float)
+    parser.add_argument("--ind_mu", help="weight of the proximal term during watermark injection", default=0.0, type=float)
+    parser.add_argument("--ind_threshold", help="discard a client whose watermark accuracy stays >= ", default=0.5, type=float)
+
+    # PGD, Neurotoxin 
     parser.add_argument("--bd_trigger_size", help="side length of the square corner trigger", default=5, type=int)
     parser.add_argument("--bd_trigger_value", help="pixel value stamped for the trigger", default=255, type=int)
     parser.add_argument("--pgd_eps", help="L2 radius of the ball ", default=1.0, type=float)
     parser.add_argument("--neuro_mask_ratio", help="fraction of top benign-gradient coordinates malicious clients freeze", default=0.1, type=float)
 
-    # Vanilla (Bagdasaryan et al. 2020), Chameleon (Dai et al. 2023) & SoDa (OOD + self-reference) baselines.
+    # Vanilla, Chameleon, SoDa 
     parser.add_argument("--chameleon_lambda", help="weight of the supervised-contrastive loss on malicious clients", default=1.0, type=float)
     parser.add_argument("--chameleon_temp", help="temperature of the supervised-contrastive loss", default=0.5, type=float)
     parser.add_argument("--soda_ood", help="OOD dataset the backdoor images are drawn from", default=None, type=str, choices=['cifar10', 'digits'])
@@ -123,7 +124,7 @@ def args_parser():
     parser.add_argument('--ckptdir', type=str, required=False,
                         default=os.path.join(_PROJECT_DIR, 'saved_models') + os.sep)
     
-    parser.add_argument('--print_interval', type=int, default=10,
+    parser.add_argument('--print_interval', type=int, default=2,
                         help='how many comm round to print results on screen')
     parser.add_argument('--save_interval', type=int, default=10,
 
@@ -251,7 +252,7 @@ if __name__ == "__main__":
                        str(args.bd_partition), str(adv_clients), args.bd_distance))
 
         # Build poisoned train loaders for the malicious clients + adversary test set
-        client2loaders, test_dl, backdoor_test_dl, train_poison_dl = build_cdls_backdoor(
+        client2loaders, test_dl, backdoor_test_dl, local_poison_dl = build_cdls_backdoor(
             args, client2dataidx, adv_clients, args.bd_target_label, args.bd_partition,
             dataset=args.dataset, domain=victim_domain, donor_domains=donor_domains,
             donor_pool_size=args.bd_donor_pool_size, max_search=args.bd_max_search, seed=args.init_seed,
@@ -275,7 +276,7 @@ if __name__ == "__main__":
                         % (args.adv_type, args.dataset, str(victim_domain), str(args.bd_target_label),
                            str(args.bd_partition), args.bd_trigger_size, str(adv_clients)))
     
-            client2loaders, test_dl, backdoor_test_dl, train_poison_dl = build_trigger_backdoor(
+            client2loaders, test_dl, backdoor_test_dl, local_poison_dl = build_trigger_backdoor(
                 args, client2dataidx, adv_clients, args.bd_target_label, args.bd_partition,
                 dataset=args.dataset, domain=victim_domain, trigger_size=args.bd_trigger_size,
                 trigger_value=args.bd_trigger_value, seed=args.init_seed)
@@ -299,7 +300,7 @@ if __name__ == "__main__":
                     % (args.dataset, str(victim_domain), ood_dataset, str(args.bd_target_label),
                        str(args.bd_partition), str(adv_clients)))
 
-        client2loaders, test_dl, backdoor_test_dl, train_poison_dl, client2clean_loaders = build_soda_backdoor(
+        client2loaders, test_dl, backdoor_test_dl, local_poison_dl, client2clean_loaders = build_soda_backdoor(
             args, client2dataidx, adv_clients, args.bd_target_label, args.bd_partition,
             dataset=args.dataset, domain=victim_domain, ood_dataset=ood_dataset, ood_domain=ood_domain,
             seed=args.init_seed)
@@ -396,7 +397,7 @@ if __name__ == "__main__":
         train_acc, train_loss = compute_accuracy(global_net, global_train_dl)
 
         if args.adv_type in ('CDLS', 'PGD', 'Neurotoxin', 'Vanilla', 'Chameleon', 'SoDa'):
-            test_acc, test_asr, local_test_asr = evaluate_acc_asr(global_net, test_dl, backdoor_test_dl, train_poison_dl)
+            test_acc, test_asr, local_test_asr = evaluate_acc_asr(global_net, test_dl, backdoor_test_dl, local_poison_dl)
             global_net.to('cpu')
             global_asr = max(test_asr, local_test_asr)
             logger.info('>> Global Model Train Acc: %f' % train_acc)

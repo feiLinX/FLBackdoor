@@ -117,20 +117,27 @@ def _grad_filter(args, global_net, recon, client_ids, logger):
             preds = global_net(imgs_t[benign].to(device)).argmax(dim=1).cpu().numpy()
         suspicious[benign[preds != labels[benign]]] = True
 
-    accepted = []
+    fracs = {}
     for cid in client_ids:
         m = owners == cid
-        frac = float(suspicious[m].mean()) if m.any() else 0.0
+        fracs[cid] = float(suspicious[m].mean()) if m.any() else 0.0
+
+    accepted = []
+    for cid in client_ids:
+        frac = fracs[cid]
         if frac > args.def_susp_threshold:
             if logger is not None:
                 logger.info('[GRAD] discard client %s (suspicious frac %.2f)' % (str(cid), frac))
         else:
             accepted.append(cid)
 
+    # if every client is flagged, fall back to the least suspicious client(s)
     if not accepted:
+        min_frac = min(fracs[cid] for cid in client_ids)
+        accepted = [cid for cid in client_ids if fracs[cid] == min_frac]
         if logger is not None:
-            logger.info('[GRAD] all clients flagged this round -> keeping all (FedAvg fallback)')
-        accepted = list(client_ids)
+            logger.info('[GRAD] all clients flagged this round -> keeping least suspicious frac %.2f: %s'
+                        % (min_frac, str(accepted)))
 
     return accepted
 

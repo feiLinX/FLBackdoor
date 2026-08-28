@@ -48,10 +48,10 @@ def compute_accuracy(model, dataloader):
     return correct / float(total), avg_loss
 
 
-def evaluate_acc_asr(model, clean_test_dl, backdoor_test_dl, train_poison_dl=None):
+def evaluate_acc_asr(model, clean_test_dl, backdoor_test_dl, local_poison_dl=None):
 
     acc, _ = compute_accuracy(model, clean_test_dl)
     asr = compute_accuracy(model, backdoor_test_dl)[0] if backdoor_test_dl is not None else float('nan')
-    train_asr = compute_accuracy(model, train_poison_dl)[0] if train_poison_dl is not None else float('nan')
+    local_asr = compute_accuracy(model, local_poison_dl)[0] if local_poison_dl is not None else float('nan')
     
-    return acc, asr, train_asr
+    return acc, asr, local_asr
