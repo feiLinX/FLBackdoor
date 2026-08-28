@@ -21,7 +21,7 @@ Built against CUDA 12.8 and cuDNN 9.7.1.
 # Data
 - Digits-5: https://drive.google.com/file/d/1RemE1_6K-laAN-yHtSb8uDhrgBdXosIg/view?usp=sharing
 - DomainNet: https://drive.google.com/file/d/1ybeC4FlmL3CA3brEhiW9CkOPaakJNkzQ/view?usp=sharing
-- Unzip each dataset to `<repo>/data` before running any script, i.e., alongside aggregations/, attacks/, etc.
+- Unzip each dataset to `<repo>/data` before running any script, i.e., in the same directory as `aggregations/`, `attacks/`, etc.
 
 # How to run
 - `main.py`: `--data_dir`, `--logdir`, and `--ckptdir` contain no hardcoded absolute paths. Their defaults are computed relative to the location of `main.py` (via `os.path.dirname(__file__)`), resolving to `<repo>/logs/` and `<repo>/saved_models/` respectively. Pass the corresponding flag on the command line if your data lives elsewhere.
