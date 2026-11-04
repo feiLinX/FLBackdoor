@@ -30,14 +30,10 @@ def poison_trigger(images, labels, target_label, poison_frac, trigger_size, trig
     return victim_idx
 
 
-def build_trigger_backdoor(args, client2dataidx, adv_clients, target_label, poison_frac,
-                           dataset='digits', domain=None, trigger_size=5, trigger_value=255, seed=0):
+def build_trigger_backdoor(args, client2dataidx, client2domain, adv_clients, target_label, poison_frac,
+                           dataset='digits', trigger_size=5, trigger_value=255, seed=0):
 
-    if dataset == 'digits' and domain is None:
-        domain = args.bd_domain
-    elif dataset == 'domain' and domain is None:
-        domain = 'clipart'
-
+    victim_domains = list(dict.fromkeys(client2domain.values()))  # the clients' domains, first-seen order
     transform_train, transform_test = get_cdls_transforms(args, dataset)
 
     # train side
@@ -45,6 +41,7 @@ def build_trigger_backdoor(args, client2dataidx, adv_clients, target_label, pois
     train_poison_images, train_poison_labels = [], []
     for client_id in range(args.nclients):
         dataidxs = client2dataidx[client_id]
+        domain = client2domain[client_id]
         if client_id in adv_clients:
             images, labels = _load_cdls_raw_images(args, dataset, domain, dataidxs, train=True)
             poisoned_idx = poison_trigger(images, labels, target_label, poison_frac,
@@ -61,7 +58,8 @@ def build_trigger_backdoor(args, client2dataidx, adv_clients, target_label, pois
             train_dl = DataLoader(dataset=train_ds, batch_size=args.batch_size, drop_last=False, shuffle=True, num_workers=4)
         else:
             train_dl, _ = get_dataloader(args, dataset=dataset, data_dir=args.data_dir,
-                                          train_bs=args.batch_size, test_bs=args.batch_size, dataidxs=dataidxs)
+                                          train_bs=args.batch_size, test_bs=args.batch_size, dataidxs=dataidxs,
+                                          domain=domain)
         client2loaders[client_id] = train_dl
 
     if train_poison_images:
@@ -71,8 +69,12 @@ def build_trigger_backdoor(args, client2dataidx, adv_clients, target_label, pois
     else:
         train_poison_dl = None
 
-    # test side
-    test_images, test_labels = _load_cdls_raw_images(args, dataset, domain, None, train=False)
+    # test side: union of the client domains' test sets
+    test_images, test_labels = [], []
+    for domain in victim_domains:
+        domain_images, domain_labels = _load_cdls_raw_images(args, dataset, domain, None, train=False)
+        test_images += domain_images
+        test_labels += domain_labels
 
     clean_test_dl = DataLoader(
         InMemoryImageDataset([im.copy() for im in test_images], list(test_labels), transform=transform_test),

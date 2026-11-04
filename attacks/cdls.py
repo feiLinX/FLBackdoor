@@ -14,31 +14,26 @@ from scipy.stats import entropy
 from torch.utils.data import Dataset, DataLoader
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data_utils import get_dataloader, TwoCropTransform
+from data_utils import get_dataloader, TwoCropTransform, DATASET_DOMAINS
 from data_aug_utils import AutoAugment
 from datasets import DigitsDataset, DomainNetDataset, CIFAR10_truncated
 
 
+# victim domains are the clients' own domains; donors default to every donor_dataset domain no client trains on
 CDLS_CONFIG = {
 
     'digits': {
-        'victim_domain': 'mnist',
         'donor_dataset': 'digits',
-        'donor_domains': ['mnist_m', 'svhn', 'syn', 'usps'],
         'exclude_target_label': True,
     },
 
     'domain': {
-        'victim_domain': 'clipart',
         'donor_dataset': 'domain',
-        'donor_domains': ['infograph', 'painting', 'quickdraw', 'real', 'sketch'],
         'exclude_target_label': True,
     },
 
     'cifar10': {
-        'victim_domain': None,
         'donor_dataset': 'digits',
-        'donor_domains': ['mnist', 'mnist_m', 'svhn', 'syn', 'usps'],
         'exclude_target_label': False,
     },
 }
@@ -80,17 +75,37 @@ def _kld_vec(p, q):
     return (0.5 * (kl_pq + kl_qp)).item()
 
 
+def _euclid(a, b):
+    """Plain L2 distance between two flattened images / representation vectors."""
+    a = torch.as_tensor(a, dtype=torch.float32).flatten()
+    b = torch.as_tensor(b, dtype=torch.float32).flatten()
+    return torch.dist(a, b).item()
+
+
+def _cos_dist(a, b):
+    """Cosine distance (1 - cosine similarity) between two flattened images / representation vectors."""
+    a = torch.as_tensor(a, dtype=torch.float32).flatten()
+    b = torch.as_tensor(b, dtype=torch.float32).flatten()
+    return 1.0 - F.cosine_similarity(a, b, dim=0).item()
+
+
+# --bd_distance <representation>_<metric>; the representation is shared across metrics
+DISTANCE_FNS = {
+    'raw_kl': _kld_raw, 'raw_euclid': _euclid, 'raw_cos': _cos_dist,
+    'embed_kl': _kld_vec, 'embed_euclid': _euclid, 'embed_cos': _cos_dist,
+    'pred_kl': _kld_vec, 'pred_euclid': _euclid, 'pred_cos': _cos_dist,
+}
+
+
 def _compute_donor_reprs(donor_pool, distance_mode, extractor):
-    """Precompute donor representations for embed_kl / pred_kl (None for raw_kl)."""
-    if distance_mode == 'raw_kl' or extractor is None:
+    """Precompute donor representations for embed_* / pred_* (None for raw_* / random)."""
+    if extractor is None or not distance_mode.startswith(('embed_', 'pred_')):
         return None
     imgs = [img for img, _ in donor_pool]
-    if distance_mode == 'embed_kl':
+    if distance_mode.startswith('embed_'):
         return F.softmax(extractor.embed(imgs), dim=1)
-    elif distance_mode == 'pred_kl':
-        return extractor.predict(imgs)
     else:
-        raise ValueError("unknown distance_mode: %s" % distance_mode)
+        return extractor.predict(imgs)
 
 
 def _make_donor_dataset(data_dir, donor_dataset, domain, train):
@@ -433,13 +448,14 @@ def poison_label_swap(images, labels, target_label, partition, donor_pool,
     victim_idx = rng.sample(victim_idx, n_replace) if n_replace > 0 else []
 
     victim_reprs = None
-    if distance_mode in ('embed_kl', 'pred_kl') and victim_idx:
+    if distance_mode.startswith(('embed_', 'pred_')) and victim_idx:
         victim_imgs = [images[i] for i in victim_idx]
-        if distance_mode == 'embed_kl':
+        if distance_mode.startswith('embed_'):
             victim_reprs = F.softmax(extractor.embed(victim_imgs), dim=1)
         else:
             victim_reprs = extractor.predict(victim_imgs)
 
+    dist_fn = DISTANCE_FNS.get(distance_mode)
     pool_size = len(donor_pool)
     replaced = []
     for vpos, idx in enumerate(victim_idx):
@@ -454,16 +470,16 @@ def poison_label_swap(images, labels, target_label, partition, donor_pool,
         best_dist, best_j = float('inf'), None
         if distance_mode == 'random':
             best_dist, best_j = 0.0, rng.randrange(pool_size)
-        elif distance_mode == 'raw_kl':
+        elif distance_mode.startswith('raw_'):
             for j in cand:
                 donor_resized = _pil_resize_like(donor_pool[j][0], target_hw)
-                dist = _kld_raw(victim_img, donor_resized)
+                dist = dist_fn(victim_img, donor_resized)
                 if dist < best_dist:
                     best_dist, best_j = dist, j
         else:
             vr = victim_reprs[vpos]
             for j in cand:
-                dist = _kld_vec(vr, donor_reprs[j])
+                dist = dist_fn(vr, donor_reprs[j])
                 if dist < best_dist:
                     best_dist, best_j = dist, j
 
@@ -515,7 +531,10 @@ def get_cdls_transforms(args, dataset):
         ])
         transform_train = transforms.Compose(transform_train)
 
+        # mnist_m / usps are 28x28, the other digit domains 32x32
         transform_test = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((32, 32)),
             transforms.ToTensor(),
             normalize,
         ])
@@ -551,15 +570,16 @@ def get_cdls_transforms(args, dataset):
 
 
 
-def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partition,
-                        dataset='digits', domain=None, donor_dataset=None, donor_domains=None,
+def build_cdls_backdoor(args, client2dataidx, client2domain, adv_clients, target_label, partition,
+                        dataset='digits', donor_dataset=None, donor_domains=None,
                         donor_pool_size=500, max_search=200, threshold=None, seed=0,
                         distance_mode='raw_kl', extractor=None):
 
     cfg = CDLS_CONFIG[dataset]
-    domain = cfg['victim_domain'] if domain is None else domain
+    victim_domains = list(dict.fromkeys(client2domain.values()))  # the clients' domains, first-seen order
     donor_dataset = cfg['donor_dataset'] if donor_dataset is None else donor_dataset
-    donor_domains = cfg['donor_domains'] if donor_domains is None else donor_domains
+    if donor_domains is None:
+        donor_domains = [d for d in DATASET_DOMAINS[donor_dataset] if d not in victim_domains]
     exclude_target = cfg['exclude_target_label']
 
     transform_train, transform_test = get_cdls_transforms(args, dataset)
@@ -574,6 +594,7 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
     train_poison_images, train_poison_labels = [], []
     for client_id in range(args.nclients):
         dataidxs = client2dataidx[client_id]
+        domain = client2domain[client_id]
         if client_id in adv_clients:
             images, labels = _load_cdls_raw_images(args, dataset, domain, dataidxs, train=True)
 
@@ -600,7 +621,8 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
             train_dl = DataLoader(dataset=train_ds, batch_size=args.batch_size, drop_last=False, shuffle=True, num_workers=4)
         else:
             train_dl, _ = get_dataloader(args, dataset=dataset, data_dir=args.data_dir,
-                                          train_bs=args.batch_size, test_bs=args.batch_size, dataidxs=dataidxs)
+                                          train_bs=args.batch_size, test_bs=args.batch_size, dataidxs=dataidxs,
+                                          domain=domain)
         client2loaders[client_id] = train_dl
 
     if train_poison_images:
@@ -615,19 +637,24 @@ def build_cdls_backdoor(args, client2dataidx, adv_clients, target_label, partiti
                                        donor_dataset=donor_dataset, exclude_target_label=exclude_target)
     test_donor_reprs = _compute_donor_reprs(test_donor_pool, distance_mode, extractor)
 
-    test_images, test_labels = _load_cdls_raw_images(args, dataset, domain, None, train=False)
-
     test_partition = 0.5 if dataset == 'domain' else partition
 
-    replaced_idx = poison_label_swap(test_images, test_labels, target_label, test_partition, test_donor_pool,
-                                      max_search=max_search, threshold=threshold, seed=seed + 10_000,
-                                      distance_mode=distance_mode, extractor=extractor,
-                                      donor_reprs=test_donor_reprs)
-    replaced_set = set(replaced_idx)
+    # ---- test side: poison each client domain's test set; clean / backdoor sets are their unions ----
+    clean_imgs, clean_lbls, bd_imgs, bd_lbls = [], [], [], []
+    for d_i, domain in enumerate(victim_domains):
+        test_images, test_labels = _load_cdls_raw_images(args, dataset, domain, None, train=False)
 
-    clean_idx = [i for i in range(len(test_labels)) if i not in replaced_set]
-    clean_imgs, clean_lbls = [test_images[i] for i in clean_idx], [test_labels[i] for i in clean_idx]
-    bd_imgs, bd_lbls = [test_images[i] for i in replaced_idx], [test_labels[i] for i in replaced_idx]
+        replaced_idx = poison_label_swap(test_images, test_labels, target_label, test_partition, test_donor_pool,
+                                          max_search=max_search, threshold=threshold, seed=seed + 10_000 + d_i,
+                                          distance_mode=distance_mode, extractor=extractor,
+                                          donor_reprs=test_donor_reprs)
+        replaced_set = set(replaced_idx)
+
+        clean_idx = [i for i in range(len(test_labels)) if i not in replaced_set]
+        clean_imgs += [test_images[i] for i in clean_idx]
+        clean_lbls += [test_labels[i] for i in clean_idx]
+        bd_imgs += [test_images[i] for i in replaced_idx]
+        bd_lbls += [test_labels[i] for i in replaced_idx]
 
     if dataset in ('domain', 'office') and args.aug_mult > 1:
         clean_imgs, clean_lbls = clean_imgs * args.aug_mult, clean_lbls * args.aug_mult

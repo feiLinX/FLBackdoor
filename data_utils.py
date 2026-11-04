@@ -1,8 +1,15 @@
 import numpy as np
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from data_aug_utils import AutoAugment
 from datasets import DigitsDataset, DomainNetDataset, OfficeDataset, CIFAR10_truncated, CIFAR100_truncated
+
+
+# all sub-domains of the multi-domain datasets (order fixes the --num_domains combination indices)
+DATASET_DOMAINS = {
+    'digits': ['mnist', 'usps', 'syn', 'svhn', 'mnist_m'],
+    'domain': ['clipart', 'painting', 'real', 'infograph','sketch', 'quickdraw'],
+}
 
 
 class TwoCropTransform:
@@ -116,20 +123,20 @@ def load_cifar100_data(data_dir):
     return (X_train, y_train, X_test, y_test)
 
 
-def partition_data(dataset, datadir, partition, n_clients, alpha=0.4):
+def partition_data(dataset, datadir, partition, n_clients, alpha=0.4, domain=None):
     if dataset == 'cifar10':
         X_train, y_train, X_test, y_test = load_cifar10_data(datadir)
     elif dataset == 'cifar100':
         X_train, y_train, X_test, y_test = load_cifar100_data(datadir)
     elif dataset == 'digits':
         dict_train, dict_test = load_digits_data(datadir)
-        y_train = np.array(dict_train['mnist'].labels)
+        y_train = np.array(dict_train['mnist' if domain is None else domain].labels)
     elif dataset == 'domain':
         dict_train, dict_test = load_domain_data(datadir)
-        y_train = np.array(dict_train['clipart'].labels)
+        y_train = np.array(dict_train['clipart' if domain is None else domain].labels)
     elif dataset == 'office':
         dict_train, dict_test = load_office_data(datadir)
-        y_train = np.array(dict_train['caltech'].labels)
+        y_train = np.array(dict_train['caltech' if domain is None else domain].labels)
     else:
         raise NotImplementedError("dataset not imeplemented")
 
@@ -169,7 +176,36 @@ def partition_data(dataset, datadir, partition, n_clients, alpha=0.4):
     return client2dataidx
 
 
-def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None):
+def partition_multi_domain(dataset, datadir, partition, n_clients, alpha, domains):
+    """Spread clients over `domains` (client i -> domains[i % k]) and partition each domain's train set
+    among its own clients, so every client holds data from exactly one domain."""
+    client2domain = {c: domains[c % len(domains)] for c in range(n_clients)}
+    client2dataidx = {}
+    for domain in domains:
+        group = [c for c in range(n_clients) if client2domain[c] == domain]
+        group2dataidx = partition_data(dataset, datadir, partition, len(group), alpha=alpha, domain=domain)
+        for j, c in enumerate(group):
+            client2dataidx[c] = group2dataidx[j]
+
+    return client2dataidx, client2domain
+
+
+def get_multi_domain_dataloader(args, dataset, data_dir, train_bs, test_bs, domains):
+    """Full train / test loaders over the union of `domains`."""
+    train_sets, test_sets = [], []
+    for domain in domains:
+        train_dl, test_dl = get_dataloader(args, dataset=dataset, data_dir=data_dir,
+                                           train_bs=train_bs, test_bs=test_bs, domain=domain)
+        train_sets.append(train_dl.dataset)
+        test_sets.append(test_dl.dataset)
+
+    train_dl = DataLoader(dataset=ConcatDataset(train_sets), batch_size=train_bs, drop_last=False, shuffle=True, num_workers=4)
+    test_dl = DataLoader(dataset=ConcatDataset(test_sets), batch_size=test_bs, shuffle=False, num_workers=4)
+
+    return train_dl, test_dl
+
+
+def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None, domain=None):
     if dataset == 'cifar10':
         dl_obj = CIFAR10_truncated
 
@@ -234,7 +270,7 @@ def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None):
     
     elif dataset == 'digits':
         dl_obj = DigitsDataset
-        subset = 'mnist'
+        subset = 'mnist' if domain is None else domain
 
         normalize = transforms.Normalize((0.1307,), (0.3081,))
         transform_train = [
@@ -253,11 +289,14 @@ def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None):
         ])
         transform_train = transforms.Compose(transform_train)
 
+        # mnist_m / usps are 28x28, the other digit domains 32x32
         transform_test = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((32, 32)),
             transforms.ToTensor(),
             normalize,
         ])
-        
+
         #transform_train, transform_test = get_digits_transforms(args)
 
         train_ds = dl_obj(data_dir, subset, dataidxs=dataidxs, train=True, transform=transform_train)
@@ -268,7 +307,7 @@ def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None):
 
     elif dataset == 'domain':
         dl_obj = DomainNetDataset
-        subset = 'clipart'
+        subset = 'clipart' if domain is None else domain
 
         # ImageNet mean/std, since DomainNet consists of natural images and models
         # here (e.g., ResNet) are typically pretrained on ImageNet
@@ -311,7 +350,7 @@ def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None):
 
     elif dataset == 'office':
         dl_obj = OfficeDataset
-        subset = 'caltech'
+        subset = 'caltech' if domain is None else domain
 
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                         std=[0.229, 0.224, 0.225])
