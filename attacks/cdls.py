@@ -19,7 +19,7 @@ from data_aug_utils import AutoAugment
 from datasets import DigitsDataset, DomainNetDataset, CIFAR10_truncated
 
 
-# victim domains are the clients' own domains; donors default to every donor_dataset domain no client trains on
+# victim domains are the malicious clients' domains (all the attacker sees); donors default to every other donor_dataset domain
 CDLS_CONFIG = {
 
     'digits': {
@@ -576,7 +576,8 @@ def build_cdls_backdoor(args, client2dataidx, client2domain, adv_clients, target
                         distance_mode='raw_kl', extractor=None):
 
     cfg = CDLS_CONFIG[dataset]
-    victim_domains = list(dict.fromkeys(client2domain.values()))  # the clients' domains, first-seen order
+    client_domains = list(dict.fromkeys(client2domain.values()))  # the clients' domains, first-seen order
+    victim_domains = list(dict.fromkeys(client2domain[c] for c in adv_clients))  # the only domains the attacker sees
     donor_dataset = cfg['donor_dataset'] if donor_dataset is None else donor_dataset
     if donor_domains is None:
         donor_domains = [d for d in DATASET_DOMAINS[donor_dataset] if d not in victim_domains]
@@ -639,15 +640,18 @@ def build_cdls_backdoor(args, client2dataidx, client2domain, adv_clients, target
 
     test_partition = 0.5 if dataset == 'domain' else partition
 
-    # ---- test side: poison each client domain's test set; clean / backdoor sets are their unions ----
+    # ---- test side: poison the victim domains' test sets (as on the train side); clean / backdoor sets are
+    # unions over all client domains ----
     clean_imgs, clean_lbls, bd_imgs, bd_lbls = [], [], [], []
-    for d_i, domain in enumerate(victim_domains):
+    for d_i, domain in enumerate(client_domains):
         test_images, test_labels = _load_cdls_raw_images(args, dataset, domain, None, train=False)
 
-        replaced_idx = poison_label_swap(test_images, test_labels, target_label, test_partition, test_donor_pool,
-                                          max_search=max_search, threshold=threshold, seed=seed + 10_000 + d_i,
-                                          distance_mode=distance_mode, extractor=extractor,
-                                          donor_reprs=test_donor_reprs)
+        replaced_idx = []
+        if domain in victim_domains:
+            replaced_idx = poison_label_swap(test_images, test_labels, target_label, test_partition, test_donor_pool,
+                                              max_search=max_search, threshold=threshold, seed=seed + 10_000 + d_i,
+                                              distance_mode=distance_mode, extractor=extractor,
+                                              donor_reprs=test_donor_reprs)
         replaced_set = set(replaced_idx)
 
         clean_idx = [i for i in range(len(test_labels)) if i not in replaced_set]

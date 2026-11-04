@@ -7,8 +7,8 @@ from datasets import DigitsDataset, DomainNetDataset, OfficeDataset, CIFAR10_tru
 
 # all sub-domains of the multi-domain datasets (order fixes the --num_domains combination indices)
 DATASET_DOMAINS = {
-    'digits': ['mnist', 'usps', 'syn', 'svhn', 'mnist_m'],
-    'domain': ['clipart', 'painting', 'real', 'infograph','sketch', 'quickdraw'],
+    'digits': ['mnist', 'mnist_m', 'svhn', 'syn', 'usps'],
+    'domain': ['clipart', 'infograph', 'painting', 'quickdraw', 'real', 'sketch'],
 }
 
 
@@ -176,10 +176,21 @@ def partition_data(dataset, datadir, partition, n_clients, alpha=0.4, domain=Non
     return client2dataidx
 
 
-def partition_multi_domain(dataset, datadir, partition, n_clients, alpha, domains):
-    """Spread clients over `domains` (client i -> domains[i % k]) and partition each domain's train set
-    among its own clients, so every client holds data from exactly one domain."""
-    client2domain = {c: domains[c % len(domains)] for c in range(n_clients)}
+def partition_multi_domain(dataset, datadir, partition, n_clients, alpha, domains, adv_domains=None):
+    """Spread clients over `domains` (n_clients / k each) and partition each domain's train set among its own
+    clients, so every client holds data from exactly one domain. Malicious client a is put on adv_domains[a];
+    the other clients fill the remaining places, interleaved over the domains."""
+    places = {d: len(range(j, n_clients, len(domains))) for j, d in enumerate(domains)}  # clients per domain
+    client2domain = {}
+    for a, domain in enumerate(adv_domains or []):
+        if places[domain] == 0:
+            raise ValueError("more malicious clients on domain '%s' than it has clients" % domain)
+        client2domain[a] = domain
+        places[domain] -= 1
+    free = [d for r in range(n_clients) for d in domains if places[d] > r]
+    for c, domain in zip(range(len(client2domain), n_clients), free):
+        client2domain[c] = domain
+
     client2dataidx = {}
     for domain in domains:
         group = [c for c in range(n_clients) if client2domain[c] == domain]

@@ -5,6 +5,8 @@ import datetime
 import json
 import argparse
 import itertools
+import collections
+import math
 import numpy as np
 import torch
 from utils import *
@@ -77,11 +79,13 @@ def args_parser():
     parser.add_argument("--adv_type", help="adv type", default='None', type=str,
                         choices=['None', 'CDLS', 'PGD', 'Neurotoxin', 'Vanilla', 'Chameleon', 'SoDa'])
     parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=2, type=int)
+    parser.add_argument("--adv_domains", help="put the malicious clients on these domains (cycling over them) and run only the domain combinations containing all of them; "
+                        "default: balanced so every domain hosts malicious clients equally often over all combinations", default=None, type=str, nargs='+')
     parser.add_argument("--bd_target_label", help="label targeted by the CDLS backdoor", default=0, type=int)
     parser.add_argument("--bd_partition", help="fraction of a client's target_label samples to replace with the cross-domain sample", default=0.3, type=float)
     parser.add_argument("--bd_domain", help="digits sub-dataset all clients are assigned to when --num_domains 1", default='mnist', type=str,
                         choices=['mnist', 'mnist_m', 'svhn', 'syn', 'usps'])
-    parser.add_argument("--bd_donor_domains", help="sub-datasets CDLS donor replacement samples may be drawn from (the clients' own domains are always excluded); defaults to every domain no client trains on", default=None, type=str, nargs='+')
+    parser.add_argument("--bd_donor_domains", help="sub-datasets CDLS donor replacement samples may be drawn from (the malicious clients' own domains are always excluded); defaults to every domain the malicious clients don't hold", default=None, type=str, nargs='+')
     parser.add_argument("--bd_donor_pool_size", help="max donor samples per domain", default=1000, type=int)
     parser.add_argument("--bd_max_search", help="max donor pool entries scanned per victim sample", default=500, type=int)
 
@@ -176,9 +180,58 @@ def init_model(nclients, args):
     return nets
 
 
+def balance_adv_domains(combos, n_adv):
+    """Domain of each of the n_adv malicious clients in every combination. Within a combination the attackers are
+    spread evenly (n_adv // k per domain); the n_adv % k leftover ones go to domains picked by a max-flow so that,
+    over all combinations, every domain hosts malicious clients equally often (+-1)."""
+    domains = list(dict.fromkeys(d for combo in combos for d in combo))
+    r = n_adv % len(combos[0])
+
+    # residual graph: src -> combination (r leftovers) -> each of its domains (1) -> sink (per-domain quota)
+    res = collections.defaultdict(lambda: collections.defaultdict(int))
+    for i, combo in enumerate(combos):
+        res['src'][i] = r
+        for d in combo:
+            res[i][('dom', d)] = 1
+
+    def augment():
+        parent, queue = {'src': None}, collections.deque(['src'])
+        while queue:
+            u = queue.popleft()
+            for v, cap in res[u].items():
+                if cap > 0 and v not in parent:
+                    parent[v] = u
+                    if v == 'sink':
+                        while v != 'src':
+                            res[parent[v]][v] -= 1
+                            res[v][parent[v]] += 1
+                            v = parent[v]
+                        return True
+                    queue.append(v)
+        return False
+
+    # fill every domain up to floor(target) first, then up to ceil(target), so none ends below floor
+    target = len(combos) * r / len(domains)
+    for quota in (math.floor(target), math.ceil(target)):
+        for d in domains:
+            res[('dom', d)]['sink'] = quota - res['sink'][('dom', d)]
+        while augment():
+            pass
+    assert all(res['src'][i] == 0 for i in range(len(combos))), "unbalanceable combination list"
+
+    plan = []
+    for i, combo in enumerate(combos):
+        n_on = {d: n_adv // len(combo) + res[('dom', d)][i] for d in combo}
+        plan.append([d for t in range(n_adv) for d in combo if n_on[d] > t])
+
+    return plan
+
+
 def get_domain_combos(args):
-    """Client-domain combinations to run: --num_domains 1 keeps the single default domain,
-    --num_domains k >= 2 enumerates every k-subset of the dataset's N domains (k <= N-1)."""
+    """(combo_id, client domains, malicious clients' domains) of every FL experiment to run.
+    --num_domains 1 keeps the single default domain, --num_domains k >= 2 enumerates every k-subset of the
+    dataset's N domains (k <= N-1). The malicious clients' domains are balanced over the full combination list,
+    or fixed by --adv_domains, in which case only the combinations containing all of them are run."""
     if args.num_domains == 1:
         if args.dataset == 'digits':
             combos = [(args.bd_domain,)]
@@ -197,10 +250,29 @@ def get_domain_combos(args):
             raise ValueError("--num_domains (%d) cannot exceed --nclients (%d)" % (args.num_domains, args.nclients))
         combos = list(itertools.combinations(all_domains, args.num_domains))
 
-    if args.combo_ids is not None:
-        combos = [combos[i] for i in args.combo_ids]
+    n_adv = 0 if args.adv_type == 'None' else args.nbyz
+    if args.adv_domains is None:
+        adv_plan = balance_adv_domains(combos, n_adv)
+    else:
+        if args.dataset not in DATASET_DOMAINS or not set(args.adv_domains) <= set(DATASET_DOMAINS[args.dataset]):
+            raise ValueError("--adv_domains must be domains of dataset '%s'; got %s" % (args.dataset, args.adv_domains))
+        if n_adv and len(args.adv_domains) > n_adv:
+            raise ValueError("--adv_domains lists %d domains but there are only %d malicious clients (--nbyz)"
+                             % (len(args.adv_domains), n_adv))
+        adv_plan = [[args.adv_domains[a % len(args.adv_domains)] for a in range(n_adv)] for _ in combos]
+    runs = [(i, list(combo), adv_plan[i]) for i, combo in enumerate(combos)]
 
-    return combos
+    if args.combo_ids is not None:
+        runs = [runs[i] for i in args.combo_ids]
+    if args.adv_domains is not None:
+        kept = [run for run in runs if set(args.adv_domains) <= set(run[1])]
+        if args.combo_ids is not None and len(kept) < len(runs):
+            raise ValueError("--combo_ids selects combinations that do not contain all --adv_domains %s" % args.adv_domains)
+        if not kept:
+            raise ValueError("no domain combination contains all --adv_domains %s" % args.adv_domains)
+        runs = kept
+
+    return runs
 
 
 def build_extractor(args, logger):
@@ -235,15 +307,17 @@ def build_extractor(args, logger):
     return extractor
 
 
-def run_fl(args, client_domains, logger, extractor=None, tag=''):
-    """One FL experiment with the clients spread over `client_domains`; returns the per-round ACC / ASR."""
+def run_fl(args, client_domains, logger, adv_domains=None, extractor=None, tag=''):
+    """One FL experiment with the clients spread over `client_domains` (malicious client a on adv_domains[a]);
+    returns the per-round ACC / ASR."""
     seed_everything(args.init_seed)
     history = {'acc': [], 'asr': []}
 
     #=============== Dataset setup ===============
     logger.info("Partitioning data")
     client2dataidx, client2domain = partition_multi_domain(args.dataset, args.data_dir, args.partition,
-                                                           args.nclients, args.bias, client_domains)
+                                                           args.nclients, args.bias, client_domains,
+                                                           adv_domains=adv_domains)
     logger.info("Client domains: %s" % str(client2domain))
 
     # union of the client domains: full train set (train acc / Neurotoxin mask) and clean test set
@@ -258,15 +332,16 @@ def run_fl(args, client_domains, logger, extractor=None, tag=''):
         cfg = CDLS_CONFIG[args.dataset]
         adv_clients = list(range(args.nbyz))
 
-        # CDLS attacks with the domains no client trains on
+        # the attacker only sees its own clients' domains and attacks with all the others
+        held_domains = list(dict.fromkeys(client2domain[c] for c in adv_clients))
         donor_domains = DATASET_DOMAINS[cfg['donor_dataset']] if args.bd_donor_domains is None else args.bd_donor_domains
-        donor_domains = [d for d in donor_domains if d not in client_domains]
+        donor_domains = [d for d in donor_domains if d not in held_domains]
         if not donor_domains:
-            raise ValueError("no CDLS donor domain left outside the client domains %s" % str(client_domains))
+            raise ValueError("no CDLS donor domain left outside the malicious clients' domains %s" % str(held_domains))
         history['donor_domains'] = donor_domains
 
-        logger.info("Building CDLS backdoor (dataset=%s, client_domains=%s, donors=%s, target_label=%s, partition=%s, adv_clients=%s, distance=%s)"
-                    % (args.dataset, str(client_domains), str(donor_domains), str(args.bd_target_label),
+        logger.info("Building CDLS backdoor (dataset=%s, client_domains=%s, attacker_domains=%s, donors=%s, target_label=%s, partition=%s, adv_clients=%s, distance=%s)"
+                    % (args.dataset, str(client_domains), str(held_domains), str(donor_domains), str(args.bd_target_label),
                        str(args.bd_partition), str(adv_clients), args.bd_distance))
 
         # Build poisoned train loaders for the malicious clients + adversary test set
@@ -446,7 +521,9 @@ def summarize_results(args, results, logger):
     for r in results:
         for m in metrics:
             r['final_' + m] = r[m][-1]
-        line = '[%s]' % '+'.join(str(d) for d in r['client_domains'])
+        line = '[combo %d: %s]' % (r['combo_id'], '+'.join(str(d) for d in r['client_domains']))
+        if r['adv_domains']:
+            line += ' (malicious clients on: %s)' % ','.join(r['adv_domains'])
         if 'donor_domains' in r:
             line += ' (CDLS donors: %s)' % '+'.join(r['donor_domains'])
         lines.append(line + ' ' + ' | '.join('%s: %f' % (m.upper(), r['final_' + m]) for m in metrics))
@@ -514,14 +591,16 @@ if __name__ == "__main__":
     extractor = build_extractor(args, logger)
 
     results = []
-    for combo_i, client_domains in enumerate(combos):
+    for run_i, (combo_id, client_domains, adv_domains) in enumerate(combos):
         combo_name = '+'.join(str(d) for d in client_domains)
-        msg = '===== Domain combination %d/%d: clients on [%s] =====' % (combo_i + 1, len(combos), combo_name)
-        logger.info(msg)
-        print(msg)
+        msg = '===== Domain combination %d/%d (combo_id %d): clients on [%s]' % (run_i + 1, len(combos), combo_id, combo_name)
+        if adv_domains:
+            msg += ', malicious clients on [%s]' % ','.join(adv_domains)
+        logger.info(msg + ' =====')
+        print(msg + ' =====')
 
         tag = '' if args.num_domains == 1 else '_' + combo_name  # keep per-combination checkpoints apart
-        history = run_fl(args, list(client_domains), logger, extractor=extractor, tag=tag)
-        results.append({'client_domains': list(client_domains), **history})
+        history = run_fl(args, client_domains, logger, adv_domains=adv_domains, extractor=extractor, tag=tag)
+        results.append({'combo_id': combo_id, 'client_domains': client_domains, 'adv_domains': adv_domains, **history})
 
     summarize_results(args, results, logger)
