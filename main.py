@@ -4,15 +4,11 @@ import logging
 import datetime
 import json
 import argparse
-import itertools
-import collections
-import math
-import numpy as np
 import torch
 from utils import *
 from data_utils import *
 from models import ResNet18, ResNet34, ResNet50, ResNet18Small, ResNet34Small, ResNet50Small, MobileNetV2, MobileNetV2Large, FangCNN
-from attacks.cdls import CDLS_CONFIG, build_cdls_backdoor, pretrain_simclr_digits, pretrain_simclr_domain, train_adv_classifier, train_adv_classifier_domain, AdversaryExtractor, apply_model_poison_constraint
+from attacks.cdls import CDLS_CONFIG, CDLS_DOMAINS, build_cdls_backdoor, pretrain_simclr_digits, pretrain_simclr_domain, train_adv_classifier, train_adv_classifier_domain, AdversaryExtractor, apply_model_poison_constraint
 from attacks.pgd import build_trigger_backdoor
 from attacks.neurotoxin import compute_neurotoxin_mask
 from attacks.vanilla import apply_model_replacement
@@ -65,10 +61,6 @@ def args_parser():
     parser.add_argument("--bias", help="degree of label non-iidness", default=1, type=float)
     parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
     parser.add_argument('--partition', type=str, default='noniid', help='the data partitioning strategy, iid or noniid')
-    parser.add_argument("--num_domains", help="# domains the clients' training data is drawn from (each client holds one domain); "
-                        "1 = all clients on --bd_domain (digits) / clipart (domain); k in [2, N-1] runs all C(N, k) domain combinations and averages ACC / ASR",
-                        default=1, type=int)
-    parser.add_argument("--combo_ids", help="run only these indices of the C(N, k) domain combinations (default: all)", default=None, type=int, nargs='+')
 
     parser.add_argument('--auto_aug', action='store_true', help='whether to apply auto augmentation')
     parser.add_argument('--aug_mult', help="replicate each client's assigned sample indices", default=10, type=int)
@@ -79,13 +71,11 @@ def args_parser():
     parser.add_argument("--adv_type", help="adv type", default='None', type=str,
                         choices=['None', 'CDLS', 'PGD', 'Neurotoxin', 'Vanilla', 'Chameleon', 'SoDa'])
     parser.add_argument("--nbyz", help="# byzantines / # adversarial clients", default=2, type=int)
-    parser.add_argument("--adv_domains", help="put the malicious clients on these domains (cycling over them) and run only the domain combinations containing all of them; "
-                        "default: balanced so every domain hosts malicious clients equally often over all combinations", default=None, type=str, nargs='+')
     parser.add_argument("--bd_target_label", help="label targeted by the CDLS backdoor", default=0, type=int)
     parser.add_argument("--bd_partition", help="fraction of a client's target_label samples to replace with the cross-domain sample", default=0.3, type=float)
-    parser.add_argument("--bd_domain", help="digits sub-dataset all clients are assigned to when --num_domains 1", default='mnist', type=str,
+    parser.add_argument("--bd_domain", help="digits sub-dataset the clients are assigned to", default='mnist', type=str,
                         choices=['mnist', 'mnist_m', 'svhn', 'syn', 'usps'])
-    parser.add_argument("--bd_donor_domains", help="sub-datasets CDLS donor replacement samples may be drawn from (the malicious clients' own domains are always excluded); defaults to every domain the malicious clients don't hold", default=None, type=str, nargs='+')
+    parser.add_argument("--bd_donor_domains", help="which domains the adversary uses to implement CDLS (donor replacement pool AND SimCLR pretraining, together with the victim --bd_domain); defaults to all domains of the dataset other than the victim domain", default=None, type=str, nargs='+')
     parser.add_argument("--bd_donor_pool_size", help="max donor samples per domain", default=1000, type=int)
     parser.add_argument("--bd_max_search", help="max donor pool entries scanned per victim sample", default=500, type=int)
 
@@ -180,193 +170,150 @@ def init_model(nclients, args):
     return nets
 
 
-def balance_adv_domains(combos, n_adv):
-    """Domain of each of the n_adv malicious clients in every combination. Within a combination the attackers are
-    spread evenly (n_adv // k per domain); the n_adv % k leftover ones go to domains picked by a max-flow so that,
-    over all combinations, every domain hosts malicious clients equally often (+-1)."""
-    domains = list(dict.fromkeys(d for combo in combos for d in combo))
-    r = n_adv % len(combos[0])
+if __name__ == "__main__":
 
-    # residual graph: src -> combination (r leftovers) -> each of its domains (1) -> sink (per-domain quota)
-    res = collections.defaultdict(lambda: collections.defaultdict(int))
-    for i, combo in enumerate(combos):
-        res['src'][i] = r
-        for d in combo:
-            res[i][('dom', d)] = 1
+    args = args_parser()
+    print(args)
+    #=============== Logging setup ===============
+    mkdirs(args.logdir)
+    mkdirs(args.ckptdir)
+    mkdirs(os.path.join(args.ckptdir, args.aggregation))
 
-    def augment():
-        parent, queue = {'src': None}, collections.deque(['src'])
-        while queue:
-            u = queue.popleft()
-            for v, cap in res[u].items():
-                if cap > 0 and v not in parent:
-                    parent[v] = u
-                    if v == 'sink':
-                        while v != 'src':
-                            res[parent[v]][v] -= 1
-                            res[v][parent[v]] += 1
-                            v = parent[v]
-                        return True
-                    queue.append(v)
-        return False
-
-    # fill every domain up to floor(target) first, then up to ceil(target), so none ends below floor
-    target = len(combos) * r / len(domains)
-    for quota in (math.floor(target), math.ceil(target)):
-        for d in domains:
-            res[('dom', d)]['sink'] = quota - res['sink'][('dom', d)]
-        while augment():
-            pass
-    assert all(res['src'][i] == 0 for i in range(len(combos))), "unbalanceable combination list"
-
-    plan = []
-    for i, combo in enumerate(combos):
-        n_on = {d: n_adv // len(combo) + res[('dom', d)][i] for d in combo}
-        plan.append([d for t in range(n_adv) for d in combo if n_on[d] > t])
-
-    return plan
-
-
-def get_domain_combos(args):
-    """(combo_id, client domains, malicious clients' domains) of every FL experiment to run.
-    --num_domains 1 keeps the single default domain, --num_domains k >= 2 enumerates every k-subset of the
-    dataset's N domains (k <= N-1). The malicious clients' domains are balanced over the full combination list,
-    or fixed by --adv_domains, in which case only the combinations containing all of them are run."""
-    if args.num_domains == 1:
-        if args.dataset == 'digits':
-            combos = [(args.bd_domain,)]
-        elif args.dataset == 'domain':
-            combos = [('clipart',)]
-        else:
-            combos = [(None,)]  # dataset's default (only) domain
+    if args.log_file_name is None:
+        argument_path = 'exp_args-%s' % datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S")
     else:
-        if args.dataset not in DATASET_DOMAINS:
-            raise ValueError("--num_domains > 1 needs a dataset in %s; got '%s'" % (list(DATASET_DOMAINS.keys()), args.dataset))
-        all_domains = DATASET_DOMAINS[args.dataset]
-        if not 2 <= args.num_domains <= len(all_domains) - 1:
-            raise ValueError("--num_domains must be in [1, %d] for dataset '%s' (at least one domain is left for CDLS); got %d"
-                             % (len(all_domains) - 1, args.dataset, args.num_domains))
-        if args.num_domains > args.nclients:
-            raise ValueError("--num_domains (%d) cannot exceed --nclients (%d)" % (args.num_domains, args.nclients))
-        combos = list(itertools.combinations(all_domains, args.num_domains))
+        argument_path = 'exp_args-%s' % args.log_file_name
 
-    n_adv = 0 if args.adv_type == 'None' else args.nbyz
-    if args.adv_domains is None:
-        adv_plan = balance_adv_domains(combos, n_adv)
-    else:
-        if args.dataset not in DATASET_DOMAINS or not set(args.adv_domains) <= set(DATASET_DOMAINS[args.dataset]):
-            raise ValueError("--adv_domains must be domains of dataset '%s'; got %s" % (args.dataset, args.adv_domains))
-        if n_adv and len(args.adv_domains) > n_adv:
-            raise ValueError("--adv_domains lists %d domains but there are only %d malicious clients (--nbyz)"
-                             % (len(args.adv_domains), n_adv))
-        adv_plan = [[args.adv_domains[a % len(args.adv_domains)] for a in range(n_adv)] for _ in combos]
-    runs = [(i, list(combo), adv_plan[i]) for i, combo in enumerate(combos)]
+    argument_path = argument_path + '.json'
 
-    if args.combo_ids is not None:
-        runs = [runs[i] for i in args.combo_ids]
-    if args.adv_domains is not None:
-        kept = [run for run in runs if set(args.adv_domains) <= set(run[1])]
-        if args.combo_ids is not None and len(kept) < len(runs):
-            raise ValueError("--combo_ids selects combinations that do not contain all --adv_domains %s" % args.adv_domains)
-        if not kept:
-            raise ValueError("no domain combination contains all --adv_domains %s" % args.adv_domains)
-        runs = kept
+    with open(os.path.join(args.logdir, argument_path), 'w') as f:
+        json.dump(str(args), f)
 
-    return runs
+    if args.log_file_name is None:
+        args.log_file_name = 'exp_log-%s' % (datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S"))
 
+    log_path = args.log_file_name + '.log'
+    print('log path: ', log_path)
 
-def build_extractor(args, logger):
-    """Adversary-side SimCLR feature extractor for CDLS embed_* / pred_* (None otherwise); it does not depend on
-    the clients' domains, so it is trained once and shared by all domain combinations."""
-    if args.adv_type != 'CDLS' or not args.bd_distance.startswith(('embed_', 'pred_')):
-        return None
+    for handler in logging.root.handlers[:]:
+        handler.close()
+        logging.root.removeHandler(handler)
 
-    if args.dataset in ('digits', 'cifar10'):
-        simclr_domains = DATASET_DOMAINS['digits']
-        logger.info("Adversary pretraining SimCLR (digits/32x32) on %s (distance=%s)" % (simclr_domains, args.bd_distance))
-        print("Adversary pretraining SimCLR (digits/32x32, distance=%s) ..." % args.bd_distance)
-        encoder = pretrain_simclr_digits(args, simclr_domains, logger=logger)
-        classifier = train_adv_classifier(encoder, args, simclr_domains, logger=logger) \
-            if args.bd_distance.startswith('pred_') else None
-        extractor = AdversaryExtractor(encoder, classifier)
-    elif args.dataset == 'domain':
-        sz = args.bd_simclr_img_size
-        simclr_domains = DATASET_DOMAINS['domain']
-        logger.info("Adversary pretraining SimCLR (DomainNet/%dx%d) on %s (distance=%s)" % (sz, sz, simclr_domains, args.bd_distance))
-        print("Adversary pretraining SimCLR (DomainNet/%dx%d, distance=%s) ..." % (sz, sz, args.bd_distance))
-        encoder = pretrain_simclr_domain(args, simclr_domains, img_size=sz, logger=logger)
-        classifier = train_adv_classifier_domain(encoder, args, simclr_domains, img_size=sz, logger=logger) \
-            if args.bd_distance.startswith('pred_') else None
-        extractor = AdversaryExtractor(
-            encoder, classifier, img_size=sz,
-            normalize=transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
-    else:
-        raise NotImplementedError(
-            "embed_* / pred_* distances are not supported for dataset='%s'" % args.dataset)
+    logging.basicConfig(
+        filename=os.path.join(args.logdir, log_path),
+        format='%(asctime)s %(levelname)-8s %(message)s',
+        datefmt='%m-%d %H:%M', level=logging.INFO, filemode='w')
 
-    return extractor
-
-
-def run_fl(args, client_domains, logger, adv_domains=None, extractor=None, tag=''):
-    """One FL experiment with the clients spread over `client_domains` (malicious client a on adv_domains[a]);
-    returns the per-round ACC / ASR."""
-    seed_everything(args.init_seed)
-    history = {'acc': [], 'asr': []}
+    logger = logging.getLogger()
+    #=============== Logging setup ===============
 
     #=============== Dataset setup ===============
     logger.info("Partitioning data")
-    client2dataidx, client2domain = partition_multi_domain(args.dataset, args.data_dir, args.partition,
-                                                           args.nclients, args.bias, client_domains,
-                                                           adv_domains=adv_domains)
-    logger.info("Client domains: %s" % str(client2domain))
+    seed_everything(args.init_seed)
 
-    # union of the client domains: full train set (train acc / Neurotoxin mask) and clean test set
-    global_train_dl, test_dl = get_multi_domain_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
-                                                           train_bs=args.batch_size, test_bs=args.batch_size,
-                                                           domains=client_domains)
+    client2dataidx = partition_data(dataset=args.dataset, datadir=args.data_dir, partition=args.partition,
+                                     n_clients=args.nclients, alpha=args.bias)
 
     adv_clients = []  # the single malicious-client list (data + model poisoning); empty for clean / no-attack runs
     client2clean_loaders = None  # SoDa: malicious clients' un-poisoned loaders (self-reference stage)
 
     if args.adv_type == 'CDLS':
+        if args.dataset not in CDLS_CONFIG:
+            raise NotImplementedError(
+                "CDLS is implemented for dataset in %s; got '%s'" % (list(CDLS_CONFIG.keys()), args.dataset))
         cfg = CDLS_CONFIG[args.dataset]
         adv_clients = list(range(args.nbyz))
 
-        # the attacker only sees its own clients' domains and attacks with all the others
-        held_domains = list(dict.fromkeys(client2domain[c] for c in adv_clients))
-        donor_domains = DATASET_DOMAINS[cfg['donor_dataset']] if args.bd_donor_domains is None else args.bd_donor_domains
-        donor_domains = [d for d in donor_domains if d not in held_domains]
-        if not donor_domains:
-            raise ValueError("no CDLS donor domain left outside the malicious clients' domains %s" % str(held_domains))
-        history['donor_domains'] = donor_domains
+        all_domains = CDLS_DOMAINS[args.dataset]
+        victim_domain = args.bd_domain if args.dataset == 'digits' else cfg['victim_domain']
 
-        logger.info("Building CDLS backdoor (dataset=%s, client_domains=%s, attacker_domains=%s, donors=%s, target_label=%s, partition=%s, adv_clients=%s, distance=%s)"
-                    % (args.dataset, str(client_domains), str(held_domains), str(donor_domains), str(args.bd_target_label),
+        if args.bd_donor_domains is not None:
+            invalid = [d for d in args.bd_donor_domains if d not in all_domains]
+            if invalid:
+                raise ValueError(
+                    "--bd_donor_domains %s not available for dataset '%s'; choose from %s"
+                    % (invalid, args.dataset, all_domains))
+            donor_domains = [d for d in args.bd_donor_domains if d != victim_domain]
+            if not donor_domains:
+                raise ValueError(
+                    "--bd_donor_domains must contain at least one domain other than the victim domain '%s'"
+                    % victim_domain)
+        elif args.dataset == 'digits':
+            donor_domains = [d for d in all_domains if d != victim_domain]
+        else:
+            donor_domains = cfg['donor_domains']
+
+        # Domains the adversary uses to implement CDLS = victim (if any) + donor domains.
+        # The SimCLR extractor is pretrained on exactly this set, so restricting
+        # --bd_donor_domains also shrinks the available SimCLR domains accordingly.
+        adv_domains = set(donor_domains) | ({victim_domain} if victim_domain is not None else set())
+        simclr_domains = [d for d in all_domains if d in adv_domains]
+
+        # --- adversary-side SimCLR feature extractor (embed_* / pred_* only) ---
+        extractor = None
+        if args.bd_distance.startswith(('embed_', 'pred_')):
+            if args.dataset in ('digits', 'cifar10'):
+                logger.info("Adversary pretraining SimCLR (digits/32x32) on %s (distance=%s)" % (simclr_domains, args.bd_distance))
+                print("Adversary pretraining SimCLR (digits/32x32, distance=%s) ..." % args.bd_distance)
+                encoder = pretrain_simclr_digits(args, simclr_domains, logger=logger)
+                classifier = train_adv_classifier(encoder, args, simclr_domains, logger=logger) \
+                    if args.bd_distance.startswith('pred_') else None
+                extractor = AdversaryExtractor(encoder, classifier)
+            elif args.dataset == 'domain':
+                sz = args.bd_simclr_img_size
+                logger.info("Adversary pretraining SimCLR (DomainNet/%dx%d) on %s (distance=%s)" % (sz, sz, simclr_domains, args.bd_distance))
+                print("Adversary pretraining SimCLR (DomainNet/%dx%d, distance=%s) ..." % (sz, sz, args.bd_distance))
+                encoder = pretrain_simclr_domain(args, simclr_domains, img_size=sz, logger=logger)
+                classifier = train_adv_classifier_domain(encoder, args, simclr_domains, img_size=sz, logger=logger) \
+                    if args.bd_distance.startswith('pred_') else None
+                extractor = AdversaryExtractor(
+                    encoder, classifier, img_size=sz,
+                    normalize=transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
+            else:
+                raise NotImplementedError(
+                    "embed_* / pred_* distances are not supported for dataset='%s'" % args.dataset)
+
+        logger.info("Building CDLS backdoor (dataset=%s, victim=%s, donors=%s, target_label=%s, partition=%s, adv_clients=%s, distance=%s)"
+                    % (args.dataset, str(victim_domain), str(donor_domains), str(args.bd_target_label),
                        str(args.bd_partition), str(adv_clients), args.bd_distance))
 
         # Build poisoned train loaders for the malicious clients + adversary test set
         client2loaders, test_dl, backdoor_test_dl, local_poison_dl = build_cdls_backdoor(
-            args, client2dataidx, client2domain, adv_clients, args.bd_target_label, args.bd_partition,
-            dataset=args.dataset, donor_domains=donor_domains,
+            args, client2dataidx, adv_clients, args.bd_target_label, args.bd_partition,
+            dataset=args.dataset, domain=victim_domain, donor_domains=donor_domains,
             donor_pool_size=args.bd_donor_pool_size, max_search=args.bd_max_search, seed=args.init_seed,
             distance_mode=args.bd_distance, extractor=extractor)
 
+        global_train_dl, _ = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
+                                         train_bs=args.batch_size, test_bs=args.batch_size)
+        
     elif args.adv_type in ('PGD', 'Neurotoxin', 'Vanilla', 'Chameleon'):
-
-        adv_clients = list(range(args.nbyz))
-
-        logger.info("Building %s trigger backdoor (dataset=%s, client_domains=%s, target_label=%s, poison_frac=%s, trigger_size=%d, adv_clients=%s)"
-                    % (args.adv_type, args.dataset, str(client_domains), str(args.bd_target_label),
-                       str(args.bd_partition), args.bd_trigger_size, str(adv_clients)))
-
-        client2loaders, test_dl, backdoor_test_dl, local_poison_dl = build_trigger_backdoor(
-            args, client2dataidx, client2domain, adv_clients, args.bd_target_label, args.bd_partition,
-            dataset=args.dataset, trigger_size=args.bd_trigger_size,
-            trigger_value=args.bd_trigger_value, seed=args.init_seed)
-
+            
+            adv_clients = list(range(args.nbyz))
+    
+            if args.dataset == 'digits':
+                victim_domain = args.bd_domain
+            elif args.dataset == 'domain':
+                victim_domain = 'clipart'
+            else:
+                victim_domain = None
+    
+            logger.info("Building %s trigger backdoor (dataset=%s, victim=%s, target_label=%s, poison_frac=%s, trigger_size=%d, adv_clients=%s)"
+                        % (args.adv_type, args.dataset, str(victim_domain), str(args.bd_target_label),
+                           str(args.bd_partition), args.bd_trigger_size, str(adv_clients)))
+    
+            client2loaders, test_dl, backdoor_test_dl, local_poison_dl = build_trigger_backdoor(
+                args, client2dataidx, adv_clients, args.bd_target_label, args.bd_partition,
+                dataset=args.dataset, domain=victim_domain, trigger_size=args.bd_trigger_size,
+                trigger_value=args.bd_trigger_value, seed=args.init_seed)
+    
+            global_train_dl, _ = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
+                                             train_bs=args.batch_size, test_bs=args.batch_size)
+            
     elif args.adv_type == 'SoDa':
 
         adv_clients = list(range(args.nbyz))
+        victim_domain = args.bd_domain if args.dataset == 'digits' else None
 
         # OOD source: digits <- cifar10, cifar10 <- digits(mnist); overridable via --soda_ood
         if args.soda_ood is not None:
@@ -375,14 +322,17 @@ def run_fl(args, client_domains, logger, adv_domains=None, extractor=None, tag='
             ood_dataset = 'cifar10' if args.dataset != 'cifar10' else 'digits'
         ood_domain = 'mnist' if ood_dataset == 'digits' else None
 
-        logger.info("Building SoDa OOD backdoor (dataset=%s, client_domains=%s, ood=%s, target_label=%s, poison_frac=%s, adv_clients=%s)"
-                    % (args.dataset, str(client_domains), ood_dataset, str(args.bd_target_label),
+        logger.info("Building SoDa OOD backdoor (dataset=%s, victim=%s, ood=%s, target_label=%s, poison_frac=%s, adv_clients=%s)"
+                    % (args.dataset, str(victim_domain), ood_dataset, str(args.bd_target_label),
                        str(args.bd_partition), str(adv_clients)))
 
         client2loaders, test_dl, backdoor_test_dl, local_poison_dl, client2clean_loaders = build_soda_backdoor(
-            args, client2dataidx, client2domain, adv_clients, args.bd_target_label, args.bd_partition,
-            dataset=args.dataset, ood_dataset=ood_dataset, ood_domain=ood_domain,
+            args, client2dataidx, adv_clients, args.bd_target_label, args.bd_partition,
+            dataset=args.dataset, domain=victim_domain, ood_dataset=ood_dataset, ood_domain=ood_domain,
             seed=args.init_seed)
+
+        global_train_dl, _ = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
+                                         train_bs=args.batch_size, test_bs=args.batch_size)
 
     elif args.adv_type == 'None':
         logger.info("No attack selected; training on clean data only")
@@ -390,10 +340,12 @@ def run_fl(args, client_domains, logger, adv_domains=None, extractor=None, tag='
         client2loaders = {}
         for client_id in range(args.nclients):
             train_dl_local, _ = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
-                                            train_bs=args.batch_size, test_bs=args.batch_size, dataidxs=client2dataidx[client_id],
-                                            domain=client2domain[client_id])
+                                            train_bs=args.batch_size, test_bs=args.batch_size, dataidxs=client2dataidx[client_id])
             client2loaders[client_id] = train_dl_local
 
+        global_train_dl, test_dl = get_dataloader(args, dataset=args.dataset, data_dir=args.data_dir,
+                                                    train_bs = args.batch_size, test_bs = args.batch_size)
+    
 
     # Random client sampling support
     clients_per_round = int(args.nclients * args.fraction)
@@ -474,8 +426,6 @@ def run_fl(args, client_domains, logger, adv_domains=None, extractor=None, tag='
             test_acc, test_asr, local_test_asr = evaluate_acc_asr(global_net, test_dl, backdoor_test_dl, local_poison_dl)
             global_net.to('cpu')
             global_asr = test_asr if args.dataset == 'digits' else max(test_asr, local_test_asr)
-            history['acc'].append(test_acc)
-            history['asr'].append(global_asr)
             logger.info('>> Global Model Train Acc: %f' % train_acc)
             logger.info('>> Global Model Test ACC: %f' % test_acc)
             logger.info('>> Global Model ASR: %f' % global_asr)
@@ -491,7 +441,6 @@ def run_fl(args, client_domains, logger, adv_domains=None, extractor=None, tag='
         elif args.adv_type == 'None':
             test_acc, test_loss = compute_accuracy(global_net, test_dl)
             global_net.to('cpu')
-            history['acc'].append(test_acc)
 
             logger.info('>> Global Model Train Acc: %f' % train_acc)
             logger.info('>> Global Model Test Acc: %f' % test_acc)
@@ -505,102 +454,6 @@ def run_fl(args, client_domains, logger, adv_domains=None, extractor=None, tag='
 
         if (comm_round + 1) % args.save_interval == 0:
             torch.save(global_net.state_dict(),
-                os.path.join(args.ckptdir, args.aggregation, 'globalmodel_'+args.log_file_name+tag+'.pth'))
+                os.path.join(args.ckptdir, args.aggregation, 'globalmodel_'+args.log_file_name+'.pth'))
             torch.save(client2nets[0].state_dict(),
-                os.path.join(args.ckptdir, args.aggregation, 'localmodel0_'+args.log_file_name+tag+'.pth'))
-
-    return history
-
-
-def summarize_results(args, results, logger):
-    """Report each combination's final-round ACC / ASR and their mean (std) over all combinations; the per-round
-    curves of every combination and their mean go to <logdir>/results-<log_file_name>.json."""
-    metrics = ['acc'] if args.adv_type == 'None' else ['acc', 'asr']
-
-    lines = ['===== Summary over %d domain combination(s), final round =====' % len(results)]
-    for r in results:
-        for m in metrics:
-            r['final_' + m] = r[m][-1]
-        line = '[combo %d: %s]' % (r['combo_id'], '+'.join(str(d) for d in r['client_domains']))
-        if r['adv_domains']:
-            line += ' (malicious clients on: %s)' % ','.join(r['adv_domains'])
-        if 'donor_domains' in r:
-            line += ' (CDLS donors: %s)' % '+'.join(r['donor_domains'])
-        lines.append(line + ' ' + ' | '.join('%s: %f' % (m.upper(), r['final_' + m]) for m in metrics))
-
-    summary = {'args': vars(args), 'combos': results}
-    for m in metrics:
-        finals = np.array([r['final_' + m] for r in results])
-        summary['mean_final_' + m] = float(finals.mean())
-        summary['std_final_' + m] = float(finals.std())
-        summary['mean_%s_per_round' % m] = np.mean([r[m] for r in results], axis=0).tolist()
-        lines.append('>> Mean %s over combinations: %f (std %f)' % (m.upper(), finals.mean(), finals.std()))
-
-    for line in lines:
-        logger.info(line)
-        print(line)
-
-    with open(os.path.join(args.logdir, 'results-%s.json' % args.log_file_name), 'w') as f:
-        json.dump(summary, f, indent=2)
-
-
-if __name__ == "__main__":
-
-    args = args_parser()
-    print(args)
-    #=============== Logging setup ===============
-    mkdirs(args.logdir)
-    mkdirs(args.ckptdir)
-    mkdirs(os.path.join(args.ckptdir, args.aggregation))
-
-    if args.log_file_name is None:
-        argument_path = 'exp_args-%s' % datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S")
-    else:
-        argument_path = 'exp_args-%s' % args.log_file_name
-
-    argument_path = argument_path + '.json'
-
-    with open(os.path.join(args.logdir, argument_path), 'w') as f:
-        json.dump(str(args), f)
-
-    if args.log_file_name is None:
-        args.log_file_name = 'exp_log-%s' % (datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S"))
-
-    log_path = args.log_file_name + '.log'
-    print('log path: ', log_path)
-
-    for handler in logging.root.handlers[:]:
-        handler.close()
-        logging.root.removeHandler(handler)
-
-    logging.basicConfig(
-        filename=os.path.join(args.logdir, log_path),
-        format='%(asctime)s %(levelname)-8s %(message)s',
-        datefmt='%m-%d %H:%M', level=logging.INFO, filemode='w')
-
-    logger = logging.getLogger()
-    #=============== Logging setup ===============
-
-    if args.adv_type == 'CDLS' and args.dataset not in CDLS_CONFIG:
-        raise NotImplementedError(
-            "CDLS is implemented for dataset in %s; got '%s'" % (list(CDLS_CONFIG.keys()), args.dataset))
-
-    combos = get_domain_combos(args)
-
-    seed_everything(args.init_seed)
-    extractor = build_extractor(args, logger)
-
-    results = []
-    for run_i, (combo_id, client_domains, adv_domains) in enumerate(combos):
-        combo_name = '+'.join(str(d) for d in client_domains)
-        msg = '===== Domain combination %d/%d (combo_id %d): clients on [%s]' % (run_i + 1, len(combos), combo_id, combo_name)
-        if adv_domains:
-            msg += ', malicious clients on [%s]' % ','.join(adv_domains)
-        logger.info(msg + ' =====')
-        print(msg + ' =====')
-
-        tag = '' if args.num_domains == 1 else '_' + combo_name  # keep per-combination checkpoints apart
-        history = run_fl(args, client_domains, logger, adv_domains=adv_domains, extractor=extractor, tag=tag)
-        results.append({'combo_id': combo_id, 'client_domains': client_domains, 'adv_domains': adv_domains, **history})
-
-    summarize_results(args, results, logger)
+                os.path.join(args.ckptdir, args.aggregation, 'localmodel0_'+args.log_file_name+'.pth'))

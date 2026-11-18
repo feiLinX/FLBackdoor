@@ -1,15 +1,8 @@
 import numpy as np
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader
 from data_aug_utils import AutoAugment
 from datasets import DigitsDataset, DomainNetDataset, OfficeDataset, CIFAR10_truncated, CIFAR100_truncated
-
-
-# all sub-domains of the multi-domain datasets (order fixes the --num_domains combination indices)
-DATASET_DOMAINS = {
-    'digits': ['mnist', 'mnist_m', 'svhn', 'syn', 'usps'],
-    'domain': ['clipart', 'infograph', 'painting', 'quickdraw', 'real', 'sketch'],
-}
 
 
 class TwoCropTransform:
@@ -123,20 +116,20 @@ def load_cifar100_data(data_dir):
     return (X_train, y_train, X_test, y_test)
 
 
-def partition_data(dataset, datadir, partition, n_clients, alpha=0.4, domain=None):
+def partition_data(dataset, datadir, partition, n_clients, alpha=0.4):
     if dataset == 'cifar10':
         X_train, y_train, X_test, y_test = load_cifar10_data(datadir)
     elif dataset == 'cifar100':
         X_train, y_train, X_test, y_test = load_cifar100_data(datadir)
     elif dataset == 'digits':
         dict_train, dict_test = load_digits_data(datadir)
-        y_train = np.array(dict_train['mnist' if domain is None else domain].labels)
+        y_train = np.array(dict_train['mnist'].labels)
     elif dataset == 'domain':
         dict_train, dict_test = load_domain_data(datadir)
-        y_train = np.array(dict_train['clipart' if domain is None else domain].labels)
+        y_train = np.array(dict_train['clipart'].labels)
     elif dataset == 'office':
         dict_train, dict_test = load_office_data(datadir)
-        y_train = np.array(dict_train['caltech' if domain is None else domain].labels)
+        y_train = np.array(dict_train['caltech'].labels)
     else:
         raise NotImplementedError("dataset not imeplemented")
 
@@ -176,47 +169,7 @@ def partition_data(dataset, datadir, partition, n_clients, alpha=0.4, domain=Non
     return client2dataidx
 
 
-def partition_multi_domain(dataset, datadir, partition, n_clients, alpha, domains, adv_domains=None):
-    """Spread clients over `domains` (n_clients / k each) and partition each domain's train set among its own
-    clients, so every client holds data from exactly one domain. Malicious client a is put on adv_domains[a];
-    the other clients fill the remaining places, interleaved over the domains."""
-    places = {d: len(range(j, n_clients, len(domains))) for j, d in enumerate(domains)}  # clients per domain
-    client2domain = {}
-    for a, domain in enumerate(adv_domains or []):
-        if places[domain] == 0:
-            raise ValueError("more malicious clients on domain '%s' than it has clients" % domain)
-        client2domain[a] = domain
-        places[domain] -= 1
-    free = [d for r in range(n_clients) for d in domains if places[d] > r]
-    for c, domain in zip(range(len(client2domain), n_clients), free):
-        client2domain[c] = domain
-
-    client2dataidx = {}
-    for domain in domains:
-        group = [c for c in range(n_clients) if client2domain[c] == domain]
-        group2dataidx = partition_data(dataset, datadir, partition, len(group), alpha=alpha, domain=domain)
-        for j, c in enumerate(group):
-            client2dataidx[c] = group2dataidx[j]
-
-    return client2dataidx, client2domain
-
-
-def get_multi_domain_dataloader(args, dataset, data_dir, train_bs, test_bs, domains):
-    """Full train / test loaders over the union of `domains`."""
-    train_sets, test_sets = [], []
-    for domain in domains:
-        train_dl, test_dl = get_dataloader(args, dataset=dataset, data_dir=data_dir,
-                                           train_bs=train_bs, test_bs=test_bs, domain=domain)
-        train_sets.append(train_dl.dataset)
-        test_sets.append(test_dl.dataset)
-
-    train_dl = DataLoader(dataset=ConcatDataset(train_sets), batch_size=train_bs, drop_last=False, shuffle=True, num_workers=4)
-    test_dl = DataLoader(dataset=ConcatDataset(test_sets), batch_size=test_bs, shuffle=False, num_workers=4)
-
-    return train_dl, test_dl
-
-
-def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None, domain=None):
+def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None):
     if dataset == 'cifar10':
         dl_obj = CIFAR10_truncated
 
@@ -281,7 +234,7 @@ def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None, do
     
     elif dataset == 'digits':
         dl_obj = DigitsDataset
-        subset = 'mnist' if domain is None else domain
+        subset = 'mnist'
 
         normalize = transforms.Normalize((0.1307,), (0.3081,))
         transform_train = [
@@ -300,14 +253,11 @@ def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None, do
         ])
         transform_train = transforms.Compose(transform_train)
 
-        # mnist_m / usps are 28x28, the other digit domains 32x32
         transform_test = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((32, 32)),
             transforms.ToTensor(),
             normalize,
         ])
-
+        
         #transform_train, transform_test = get_digits_transforms(args)
 
         train_ds = dl_obj(data_dir, subset, dataidxs=dataidxs, train=True, transform=transform_train)
@@ -318,7 +268,7 @@ def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None, do
 
     elif dataset == 'domain':
         dl_obj = DomainNetDataset
-        subset = 'clipart' if domain is None else domain
+        subset = 'clipart'
 
         # ImageNet mean/std, since DomainNet consists of natural images and models
         # here (e.g., ResNet) are typically pretrained on ImageNet
@@ -361,7 +311,7 @@ def get_dataloader(args, dataset, data_dir, train_bs, test_bs, dataidxs=None, do
 
     elif dataset == 'office':
         dl_obj = OfficeDataset
-        subset = 'caltech' if domain is None else domain
+        subset = 'caltech'
 
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                         std=[0.229, 0.224, 0.225])

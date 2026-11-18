@@ -27,11 +27,13 @@ def soda_self_reference(global_net, clean_loader, args):
     return torch.nn.utils.parameters_to_vector([p.detach() for p in ref.parameters()]).detach()
 
 
-def build_soda_backdoor(args, client2dataidx, client2domain, adv_clients, target_label, poison_frac,
-                        dataset='digits', ood_dataset='cifar10', ood_domain=None,
+def build_soda_backdoor(args, client2dataidx, adv_clients, target_label, poison_frac,
+                        dataset='digits', domain=None, ood_dataset='cifar10', ood_domain=None,
                         ood_test_size=2000, seed=0):
 
-    victim_domains = list(dict.fromkeys(client2domain.values()))  # the clients' domains, first-seen order
+    if dataset == 'digits' and domain is None:
+        domain = args.bd_domain
+
     transform_train, transform_test = get_cdls_transforms(args, dataset)
     rng = random.Random(seed)
 
@@ -43,7 +45,6 @@ def build_soda_backdoor(args, client2dataidx, client2domain, adv_clients, target
     train_poison_images, train_poison_labels = [], []
     for client_id in range(args.nclients):
         dataidxs = client2dataidx[client_id]
-        domain = client2domain[client_id]
         if client_id in adv_clients:
             images, labels = _load_cdls_raw_images(args, dataset, domain, dataidxs, train=True)
 
@@ -66,8 +67,7 @@ def build_soda_backdoor(args, client2dataidx, client2domain, adv_clients, target
             train_dl = DataLoader(train_ds, batch_size=args.batch_size, drop_last=False, shuffle=True, num_workers=4)
         else:
             train_dl, _ = get_dataloader(args, dataset=dataset, data_dir=args.data_dir,
-                                          train_bs=args.batch_size, test_bs=args.batch_size, dataidxs=dataidxs,
-                                          domain=domain)
+                                          train_bs=args.batch_size, test_bs=args.batch_size, dataidxs=dataidxs)
         client2loaders[client_id] = train_dl
 
     train_poison_dl = DataLoader(
@@ -75,12 +75,7 @@ def build_soda_backdoor(args, client2dataidx, client2domain, adv_clients, target
         batch_size=args.batch_size, shuffle=False, num_workers=4) if train_poison_images else None
 
 
-    # union of the client domains' test sets
-    test_images, test_labels = [], []
-    for domain in victim_domains:
-        domain_images, domain_labels = _load_cdls_raw_images(args, dataset, domain, None, train=False)
-        test_images += domain_images
-        test_labels += domain_labels
+    test_images, test_labels = _load_cdls_raw_images(args, dataset, domain, None, train=False)
     clean_test_dl = DataLoader(
         InMemoryImageDataset([im.copy() for im in test_images], list(test_labels), transform=transform_test),
         batch_size=args.batch_size, shuffle=False, num_workers=4)

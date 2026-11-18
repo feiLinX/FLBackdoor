@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Digits-5 | model=MobileNetV2 | nclients=20 | num_domains (k)=2 | nbyz=2 | bd_partition=0.3 | aggregation=bnguard
-# CDLS option: CDLS pred_kl + full model poisoning (stealth reg lambda=1e-3 + constrain-and-scale scale=2.0)
-# Runs all C(5,2)=10 client-domain combinations in sequence; reports each combination's final ACC / ASR and their mean
+# Digits-5 | model=MobileNetV2 | nclients=20 | aggregation=bnguard
+# CDLS option: CDLS with pred_kl donor selection + full model poisoning (stealth reg + constrain-and-scale)
+# Adversary domains: victim mnist + 2 donor domains (syn, usps); SimCLR pretrained on mnist, syn, usps
 set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
@@ -14,16 +14,17 @@ SCRIPT="$(dirname "$0")/../main.py"
     --wd 1e-5 \
     --aggregation bnguard \
     --nclients 20 \
-    --nrounds 35 \
+    --nrounds 60 \
     --epochs 5 \
     --krum_m 15 \
-    --num_domains 2 \
     --adv_type CDLS \
     --nbyz 2 \
     --bd_target_label 0 \
     --bd_partition 0.3 \
+    --bd_domain mnist \
+    --bd_donor_domains syn usps \
     --bd_distance pred_kl \
     --bd_model_poison \
     --bd_stealth_lambda 1e-3 \
     --bd_scale 2.0 \
-    --log_file_name digits_mobilenetv2_nclients_20_ndomains_2_agg_bnguard_att_pred+model_full
+    --log_file_name digits_mobilenetv2_nclients_20_agg_bnguard_att_pred+model_full_donors_syn+usps
